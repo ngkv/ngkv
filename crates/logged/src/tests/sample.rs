@@ -49,7 +49,7 @@ impl SampleStorage {
 struct SampleStateMachineState {
     num: i32,
     lsn: LSN,
-    persister_thread: JoinHandle<()>,
+    persister_thread: Option<JoinHandle<()>>,
     persister_do_send: Sender<()>,
     persister_kill_send: Sender<()>,
 }
@@ -127,12 +127,15 @@ impl SampleStateMachine {
 
 impl Drop for SampleStateMachine {
     fn drop(&mut self) {
-        if let Some(state) = self.0.try_get_state() {
+        let _thread;
+        if let Some(mut state) = self.0.try_get_state() {
             state
                 .persister_kill_send
                 .send(())
                 .expect("kill persister failed");
+            _thread = state.persister_thread.take().unwrap();
         }
+        // JoinHandle _thread drops here, without state mutex held.
     }
 }
 
@@ -161,10 +164,10 @@ impl StateMachine for SampleStateMachine {
                     num,
                     persister_kill_send: kill_send,
                     persister_do_send: do_send,
-                    persister_thread: {
+                    persister_thread: Some({
                         let this = self.0.clone();
                         std::thread::spawn(|| this.do_work_persister(do_recv, kill_recv))
-                    },
+                    }),
                 }
                 .into(),
             )

@@ -48,7 +48,7 @@ struct StorageShared<Op> {
 #[derive(SmartDefault)]
 struct SyncShared<Op> {
     pendings: Mutex<VecDeque<PendingLog<Op>>>,
-    thread: OnceCell<JoinHandle<()>>,
+    thread: Mutex<Option<JoinHandle<()>>>,
     sink: OnceCell<Box<dyn Send + Sync + Fn(LSN)>>,
     killed: AtomicBool,
     cond: Condvar,
@@ -74,6 +74,10 @@ impl<Op> Drop for WriteImpl<Op> {
     fn drop(&mut self) {
         self.sync.killed.store(true, Ordering::Relaxed);
         self.sync.cond.notify_one();
+
+        // Join thread here. This ensures that sync sink would not be called
+        // after drop.
+        let _thread = self.sync.thread.lock().unwrap().take();
     }
 }
 
@@ -91,9 +95,10 @@ impl<Op> WriteImpl<Op> {
                 loop {
                     let mut pendings = sync.pendings.lock().unwrap();
 
-                    // wait till one of following occurs:
-                    // 1. killed
-                    // 2. sync time of *first* record in the pending queue has been reached
+                    // Wait till one of following occurs:
+                    // 1. Killed.
+                    // 2. Sync time of *first* record in the pending queue has
+                    //    been reached.
                     while !sync.killed.load(Ordering::Relaxed) {
                         if let Some(p) = pendings.front() {
                             let now = Instant::now();
@@ -113,7 +118,7 @@ impl<Op> WriteImpl<Op> {
                         break;
                     }
 
-                    // find the highest possible sync lsn
+                    // Find the highest possible sync lsn.
                     let mut sync_lsn = None;
                     let mut sync_recs = vec![];
                     while let Some(p) = pendings.front() {
@@ -136,7 +141,7 @@ impl<Op> WriteImpl<Op> {
             }
         });
 
-        sync.thread.set(thread).unwrap();
+        *sync.thread.lock().unwrap() = Some(thread);
         Self { sync, stor }
     }
 }

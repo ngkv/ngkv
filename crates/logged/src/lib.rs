@@ -1,4 +1,5 @@
 mod log_ctx;
+mod log_file;
 mod log_mem;
 mod state_machine;
 #[cfg(test)]
@@ -7,7 +8,7 @@ mod tests;
 use anyhow::Result;
 
 // crate
-pub use crate::{log_ctx::*, log_mem::*, state_machine::*};
+pub use crate::{log_ctx::*, log_file::*, log_mem::*, state_machine::*};
 
 // std
 use std::{
@@ -189,7 +190,11 @@ mod block_ck {
         let now = Instant::now();
         f();
         let time = Instant::now() - now;
-        assert!(time >= dur, "check_blocking failed ({}ms)", time.as_millis());
+        assert!(
+            time >= dur,
+            "check_blocking failed ({}ms)",
+            time.as_millis()
+        );
     }
 }
 
