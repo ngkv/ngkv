@@ -11,27 +11,17 @@ use std::{
 use crate::{LogCtx, LogDiscard, LogRead, LogWrite, LSN};
 use anyhow::Result;
 use once_cell::sync::OnceCell;
+use smart_default::SmartDefault;
 
-pub struct MemLogStorage<Op>(Arc<MemLogInner<Op>>);
+pub struct MemLogStorage<Op>(Arc<StorageShared<Op>>);
 
 impl<Op> MemLogStorage<Op> {
     pub fn new(sync_delay: Duration) -> Self {
-        Self(Arc::new(MemLogInner {
-            sync_delay,
-            sync_killed: AtomicBool::new(false),
-            sync_cond: Condvar::new(),
-            sync_sink: OnceCell::new(),
-            state: Mutex::new(MemLogState {
-                records: VecDeque::new(),
-                pendings: VecDeque::new(),
-                cur_lsn: 0,
-                sync_thread: None,
-            }),
-        }))
+        Self(Arc::new(StorageShared::default()))
     }
 
     pub fn len(&self) -> usize {
-        self.0.state.lock().unwrap().records.len()
+        self.0.records.lock().unwrap().len()
     }
 }
 
@@ -47,162 +37,156 @@ struct PendingLog<Op> {
     sync_time: Instant,
 }
 
-struct MemLogState<Op> {
-    records: VecDeque<MemLogRecord<Op>>,
-    pendings: VecDeque<PendingLog<Op>>,
-    cur_lsn: LSN,
-    sync_thread: Option<JoinHandle<()>>,
-}
-
-struct SyncState {
-    sync_thread: Option<JoinHandle<()>>,
-    sync_killed: AtomicBool,
-    sync_cond: Condvar,
+#[derive(SmartDefault)]
+struct StorageShared<Op> {
+    records: Mutex<VecDeque<MemLogRecord<Op>>>,
     sync_delay: Duration,
-    sync_sink: OnceCell<Box<dyn Send + Sync + Fn(LSN)>>,
+}
+#[derive(SmartDefault)]
+struct SyncShared<Op> {
+    pendings: Mutex<VecDeque<PendingLog<Op>>>,
+    thread: OnceCell<JoinHandle<()>>,
+    sink: OnceCell<Box<dyn Send + Sync + Fn(LSN)>>,
+    killed: AtomicBool,
+    cond: Condvar,
 }
 
-struct MemLogInner<Op> {
-    state: Mutex<MemLogState<Op>>,
-    sync_killed: AtomicBool,
-    sync_cond: Condvar,
-    sync_delay: Duration,
-    sync_sink: OnceCell<Box<dyn Send + Sync + Fn(LSN)>>,
+struct ReadDiscardImpl<Op> {
+    stor: Arc<StorageShared<Op>>,
 }
 
-struct MemLogImpl<Op>(Arc<MemLogInner<Op>>);
+impl<Op> ReadDiscardImpl<Op> {
+    fn new(stor: Arc<StorageShared<Op>>) -> Self {
+        Self { stor }
+    }
+}
 
-impl<Op> MemLogImpl<Op> {
-    fn spawn_sync_thread(&self)
+// LOCK ORDER: sync, stor
+struct WriteImpl<Op> {
+    sync: Arc<SyncShared<Op>>,
+    stor: Arc<StorageShared<Op>>,
+}
+
+impl<Op> Drop for WriteImpl<Op> {
+    fn drop(&mut self) {
+        self.sync.killed.store(true, Ordering::Relaxed);
+        self.sync.cond.notify_one();
+    }
+}
+
+impl<Op> WriteImpl<Op> {
+    fn new(stor: Arc<StorageShared<Op>>) -> Self
     where
         Op: Send + Sync + 'static,
     {
-        let mut state = self.0.state.lock().unwrap();
-        assert!(state.sync_thread.is_none());
+        let sync = Arc::new(SyncShared::default());
 
-        let this = self.0.clone();
-        state.sync_thread = Some(spawn(move || {
-            loop {
-                let mut state = this.state.lock().unwrap();
+        let thread = spawn({
+            let sync = sync.clone();
+            let stor = stor.clone();
+            move || {
+                loop {
+                    let mut pendings = sync.pendings.lock().unwrap();
 
-                // wait till one of following occurs:
-                // 1. killed
-                // 2. sync time of *first* record in the pending queue has been reached
-                while !this.sync_killed.load(Ordering::Relaxed) {
-                    if let Some(p) = state.pendings.front() {
-                        let now = Instant::now();
-                        if p.sync_time <= now {
-                            break;
+                    // wait till one of following occurs:
+                    // 1. killed
+                    // 2. sync time of *first* record in the pending queue has been reached
+                    while !sync.killed.load(Ordering::Relaxed) {
+                        if let Some(p) = pendings.front() {
+                            let now = Instant::now();
+                            if p.sync_time <= now {
+                                break;
+                            } else {
+                                let sleep = p.sync_time - now;
+                                let (s, _) = sync.cond.wait_timeout(pendings, sleep).unwrap();
+                                pendings = s;
+                            }
                         } else {
-                            let sleep = p.sync_time - now;
-                            let (s, _) = this.sync_cond.wait_timeout(state, sleep).unwrap();
-                            state = s;
+                            pendings = sync.cond.wait(pendings).unwrap();
                         }
-                    } else {
-                        state = this.sync_cond.wait(state).unwrap();
                     }
-                }
 
-                if this.sync_killed.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                // find the highest possible sync lsn
-                let mut sync_lsn = None;
-                while let Some(p) = state.pendings.front() {
-                    if p.sync_time <= Instant::now() {
-                        let p = state.pendings.pop_front().unwrap();
-                        sync_lsn = Some(p.lsn);
-                        state.records.push_back(MemLogRecord {
-                            lsn: p.lsn,
-                            op: p.op,
-                        });
-                    } else {
+                    if sync.killed.load(Ordering::Relaxed) {
                         break;
                     }
+
+                    // find the highest possible sync lsn
+                    let mut sync_lsn = None;
+                    let mut sync_recs = vec![];
+                    while let Some(p) = pendings.front() {
+                        if p.sync_time <= Instant::now() {
+                            let p = pendings.pop_front().unwrap();
+                            sync_lsn = Some(p.lsn);
+                            sync_recs.push(MemLogRecord {
+                                lsn: p.lsn,
+                                op: p.op,
+                            });
+                        } else {
+                            break;
+                        }
+                    }
+
+                    stor.records.lock().unwrap().extend(sync_recs);
+                    let sync_lsn = sync_lsn.expect("guaranteed by cond var");
+                    sync.sink.get().expect("should init first")(sync_lsn);
                 }
-
-                // garunteed by cond var
-                let sync_lsn = sync_lsn.expect("sync lsn not found");
-
-                // drop lock to invoke sync sink
-                // prevent deadlock
-                drop(state);
-                let sync_sink = this.sync_sink.get().expect("not init");
-                sync_sink(sync_lsn);
             }
-        }));
-    }
+        });
 
-    fn kill_sync_thread(&self) {
-        self.0.sync_killed.store(true, Ordering::Relaxed);
-        self.0.sync_cond.notify_one();
-
-        let _thread = self.0.state.lock().unwrap().sync_thread.take();
+        sync.thread.set(thread).unwrap();
+        Self { sync, stor }
     }
 }
 
-impl<Op> Drop for MemLogImpl<Op> {
-    fn drop(&mut self) {
-        self.kill_sync_thread();
-    }
-}
-
-impl<Op> LogRead<Op> for MemLogImpl<Op>
-where
-    Op: Send + Sync + Clone + 'static,
-{
-    fn read(&mut self, start: LSN) -> Result<Box<dyn Iterator<Item = (Op, LSN)>>> {
-        let state = self.0.state.lock().unwrap();
-        let records = state
-            .records
-            .iter()
-            .filter(|rec| rec.lsn >= start)
-            .cloned()
-            .collect::<Vec<_>>();
-
-        Ok(Box::new(records.into_iter().map(|rec| (rec.op, rec.lsn))))
-    }
-}
-
-impl<Op> LogWrite<Op> for MemLogImpl<Op>
+impl<Op> LogWrite<Op> for WriteImpl<Op>
 where
     Op: Send + Sync + Clone + 'static,
 {
     fn init(&mut self, sink: Box<dyn Send + Sync + Fn(LSN)>) {
-        self.0
-            .sync_sink
+        self.sync
+            .sink
             .set(sink)
             .map_err(|_| ())
             .expect("already init");
-
-        self.spawn_sync_thread();
     }
 
     fn fire_write(&mut self, op: &Op, lsn: LSN) {
-        let mut state = self.0.state.lock().unwrap();
-
-        assert!(state.cur_lsn < lsn);
-        state.cur_lsn = lsn;
-
-        state.pendings.push_back(PendingLog {
+        let mut pendings = self.sync.pendings.lock().unwrap();
+        pendings.push_back(PendingLog {
             lsn,
             op: op.clone(),
-            sync_time: Instant::now() + self.0.sync_delay,
+            sync_time: Instant::now() + self.stor.sync_delay,
         });
-        self.0.sync_cond.notify_one();
+
+        self.sync.cond.notify_one();
     }
 }
 
-impl<Op> LogDiscard for MemLogImpl<Op>
+impl<Op> LogRead<Op> for ReadDiscardImpl<Op>
 where
     Op: Send + Sync + Clone + 'static,
 {
-    fn discard(&mut self, lsn: LSN) {
-        let mut state = self.0.state.lock().unwrap();
-        while let Some(rec) = state.records.front() {
+    fn read(&mut self, start: LSN) -> Result<Box<dyn Iterator<Item = (Op, LSN)>>> {
+        let records = self.stor.records.lock().unwrap();
+        let res_vec = records
+            .iter()
+            .filter(|rec| rec.lsn >= start)
+            .map(|rec| (rec.op.clone(), rec.lsn))
+            .collect::<Vec<_>>();
+
+        Ok(Box::new(res_vec.into_iter()))
+    }
+}
+
+impl<Op> LogDiscard for ReadDiscardImpl<Op>
+where
+    Op: Send + Sync + Clone + 'static,
+{
+    fn fire_discard(&mut self, lsn: LSN) {
+        let mut records = self.stor.records.lock().unwrap();
+        while let Some(rec) = records.front() {
             if rec.lsn <= lsn {
-                state.records.pop_front();
+                records.pop_front();
             } else {
                 break;
             }
@@ -215,11 +199,10 @@ where
     Op: Send + Sync + Clone + 'static,
 {
     pub fn memory(mem: &mut MemLogStorage<Op>) -> Self {
-        let mk_boxed = || Box::new(MemLogImpl::<Op>(mem.0.clone()));
         Self {
-            read: mk_boxed(),
-            write: mk_boxed(),
-            discard: mk_boxed(),
+            write: Box::new(WriteImpl::<Op>::new(mem.0.clone())),
+            read: Box::new(ReadDiscardImpl::<Op>::new(mem.0.clone())),
+            discard: Box::new(ReadDiscardImpl::<Op>::new(mem.0.clone())),
         }
     }
 }
@@ -269,7 +252,7 @@ mod tests {
             assert_eq!(read_res, vec![(TestOp { no: 2 }, 2)]);
         }
 
-        ctx.discard.discard(1);
+        ctx.discard.fire_discard(1);
 
         {
             let read_res = ctx.read.read(0).unwrap().collect::<Vec<_>>();

@@ -162,6 +162,7 @@ dependencies = [
  "mockall",
  "once_cell",
  "serde",
+ "smart-default",
 ]
 
 [[package]]
@@ -319,6 +320,17 @@ name = "serde_derive"
 version = "1.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "552954ce79a059ddd5fd68c271592374bd15cab2274970380c000118aeffe1cd"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "smart-default"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "133659a15339456eeeb07572eb02a91c91e9815e9cbc89566944d2c8d3efdbf6"
 dependencies = [
  "proc-macro2",
  "quote",

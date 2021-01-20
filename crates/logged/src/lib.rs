@@ -57,7 +57,7 @@ impl<S: StateMachine> ReportSink for ReportSinkImpl<S> {
         // which could be safely discarded
         let this = Weak::upgrade(&self.logged).expect("already destroyed");
         let mut state = this.state.lock().unwrap();
-        state.log_discard.discard(lsn);
+        state.log_discard.fire_discard(lsn);
     }
 }
 

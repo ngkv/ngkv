@@ -11,7 +11,7 @@ pub trait LogWrite<Op>: Send + Sync {
 }
 
 pub trait LogDiscard: Send + Sync {
-    fn discard(&mut self, lsn: LSN);
+    fn fire_discard(&mut self, lsn: LSN);
 }
 pub struct LogCtx<Op> {
     pub(crate) read: Box<dyn LogRead<Op>>,
