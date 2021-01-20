@@ -17,7 +17,10 @@ pub struct MemLogStorage<Op>(Arc<StorageShared<Op>>);
 
 impl<Op> MemLogStorage<Op> {
     pub fn new(sync_delay: Duration) -> Self {
-        Self(Arc::new(StorageShared::default()))
+        Self(Arc::new(StorageShared {
+            sync_delay,
+            ..Default::default()
+        }))
     }
 
     pub fn len(&self) -> usize {
@@ -211,7 +214,9 @@ where
 mod tests {
     use std::{thread::sleep, time::Duration, vec};
 
-    use crate::{LogCtx, MemLogStorage, LSN};
+    use anyhow::Result;
+
+    use crate::{check_non_blocking, LogCtx, MemLogStorage, LSN};
 
     #[derive(Clone, Eq, PartialEq, Debug)]
     struct TestOp {
@@ -237,8 +242,8 @@ mod tests {
             }
         };
 
-        ctx.write.fire_write(&TestOp { no: 1 }, 1);
-        ctx.write.fire_write(&TestOp { no: 2 }, 2);
+        check_non_blocking(|| ctx.write.fire_write(&TestOp { no: 1 }, 1));
+        check_non_blocking(|| ctx.write.fire_write(&TestOp { no: 2 }, 2));
 
         expect_lsn_sync(2);
 
@@ -252,7 +257,7 @@ mod tests {
             assert_eq!(read_res, vec![(TestOp { no: 2 }, 2)]);
         }
 
-        ctx.discard.fire_discard(1);
+        check_non_blocking(|| ctx.discard.fire_discard(1));
 
         {
             let read_res = ctx.read.read(0).unwrap().collect::<Vec<_>>();
@@ -279,5 +284,42 @@ mod tests {
             let read_res = ctx.read.read(0).unwrap().collect::<Vec<_>>();
             assert_eq!(read_res, vec![]);
         }
+    }
+
+    #[test]
+    fn mem_log_durable() -> Result<()> {
+        let mut stor = MemLogStorage::new(Duration::from_millis(50));
+
+        {
+            let mut ctx = LogCtx::<TestOp>::memory(&mut stor);
+            let (send, recv) = crossbeam::channel::bounded(0);
+
+            ctx.write.init(Box::new(move |lsn| {
+                send.send(lsn).unwrap();
+            }));
+
+            let mut cur_lsn = 0;
+            let cur_lsn_ref = &mut cur_lsn;
+            let mut expect_lsn_sync = move |lsn: LSN| {
+                while lsn > *cur_lsn_ref {
+                    *cur_lsn_ref = recv.recv().unwrap();
+                }
+            };
+
+            check_non_blocking(|| ctx.write.fire_write(&TestOp { no: 4 }, 4));
+            check_non_blocking(|| ctx.write.fire_write(&TestOp { no: 5 }, 5));
+
+            expect_lsn_sync(5);
+
+            check_non_blocking(|| drop(ctx));
+        }
+
+        {
+            let mut ctx = LogCtx::<TestOp>::memory(&mut stor);
+            let read_res = ctx.read.read(4)?.collect::<Vec<_>>();
+            assert_eq!(read_res, vec![(TestOp { no: 4 }, 4), (TestOp { no: 5 }, 5)]);
+        }
+
+        Ok(())
     }
 }

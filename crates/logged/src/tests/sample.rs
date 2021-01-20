@@ -321,17 +321,25 @@ fn logged_sample_sm_normal() -> Result<()> {
 #[test]
 fn logged_sample_sm_sync_durable() -> Result<()> {
     let storage = Arc::new(SampleStorage::new(3, 1));
-    let mut mem_log = MemLogStorage::new(Duration::from_secs(0));
+    let mut mem_log = MemLogStorage::new(Duration::from_millis(50));
 
     {
         let sm = SampleStateMachine::new(storage.clone());
         let logged = Logged::new(sm, LogCtx::memory(&mut mem_log))?;
 
-        logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: true });
+        check_blocking(
+            || logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: true }),
+            Duration::from_millis(50),
+        );
         assert_eq!(logged.get_num(), 2);
 
-        logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: true });
+        check_blocking(
+            || logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: true }),
+            Duration::from_millis(50),
+        );
         assert_eq!(logged.get_num(), 3);
+
+        check_non_blocking(|| drop(logged));
     }
 
     {
@@ -352,18 +360,22 @@ fn logged_sample_sm_sync_durable() -> Result<()> {
 #[test]
 fn logged_sample_sm_async_lost() -> Result<()> {
     let storage = Arc::new(SampleStorage::new(3, 1));
-    let mut mem_log = MemLogStorage::new(Duration::from_secs(0));
+    let mut mem_log = MemLogStorage::new(Duration::from_millis(50));
 
     {
         let sm = SampleStateMachine::new(storage.clone());
         let logged = Logged::new(sm, LogCtx::memory(&mut mem_log))?;
 
-        logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: false });
+        check_non_blocking(|| logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: false }));
         assert_eq!(logged.get_num(), 2);
 
-        logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: false });
+        check_non_blocking(|| logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: false }));
         assert_eq!(logged.get_num(), 3);
+
+        check_non_blocking(|| drop(logged));
     }
+
+    sleep(Duration::from_millis(100));
 
     {
         let sm = SampleStateMachine::new(storage.clone());

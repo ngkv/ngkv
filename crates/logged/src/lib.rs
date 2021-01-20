@@ -156,7 +156,7 @@ impl<S: StateMachine> Logged<S> {
         if options.is_sync {
             // cur_pending must be Some
             let pending = cur_pending.unwrap();
-            while pending.done.load(Ordering::Relaxed) {
+            while !pending.done.load(Ordering::Relaxed) {
                 state = pending.cond.wait(state).unwrap();
             }
         }
@@ -164,3 +164,34 @@ impl<S: StateMachine> Logged<S> {
         self.0.sm.apply(op, lsn)
     }
 }
+
+#[cfg(test)]
+mod block_ck {
+    use std::time::{Duration, Instant};
+
+    const ENABLE_CHECK_NON_BLOCKING: bool = false;
+    const NON_BLOCKING_THRESHOLD: Duration = Duration::from_millis(10);
+
+    pub fn check_non_blocking(f: impl FnOnce()) {
+        let now = Instant::now();
+        f();
+        let time = Instant::now() - now;
+        if ENABLE_CHECK_NON_BLOCKING {
+            assert!(
+                time < NON_BLOCKING_THRESHOLD,
+                "check_non_blocking failed ({}ms)",
+                time.as_millis()
+            );
+        }
+    }
+
+    pub fn check_blocking(f: impl FnOnce(), dur: Duration) {
+        let now = Instant::now();
+        f();
+        let time = Instant::now() - now;
+        assert!(time >= dur, "check_blocking failed ({}ms)", time.as_millis());
+    }
+}
+
+#[cfg(test)]
+use block_ck::*;
