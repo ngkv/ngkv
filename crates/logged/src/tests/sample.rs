@@ -46,7 +46,7 @@ impl SampleStorage {
 }
 
 #[derive(Debug)]
-struct SampleStateMachineInner {
+struct SampleStateMachineState {
     num: i32,
     lsn: LSN,
     persister_thread: JoinHandle<()>,
@@ -54,19 +54,19 @@ struct SampleStateMachineInner {
     persister_kill_send: Sender<()>,
 }
 
-struct SampleStateMachineImpl {
-    inner: OnceCell<Mutex<SampleStateMachineInner>>,
+struct SampleStateMachineInner {
+    state: OnceCell<Mutex<SampleStateMachineState>>,
     storage: Arc<SampleStorage>,
     sink: OnceCell<Box<dyn ReportSink>>,
 }
 
-impl SampleStateMachineImpl {
-    fn get_inner<'a>(&'a self) -> MutexGuard<'a, SampleStateMachineInner> {
-        self.inner.get().expect("not initialized").lock().unwrap()
+impl SampleStateMachineInner {
+    fn get_state<'a>(&'a self) -> MutexGuard<'a, SampleStateMachineState> {
+        self.state.get().expect("not initialized").lock().unwrap()
     }
 
-    fn try_get_inner<'a>(&'a self) -> Option<MutexGuard<'a, SampleStateMachineInner>> {
-        Some(self.inner.get()?.lock().unwrap())
+    fn try_get_state<'a>(&'a self) -> Option<MutexGuard<'a, SampleStateMachineState>> {
+        Some(self.state.get()?.lock().unwrap())
     }
 
     fn do_work_persister(self: Arc<Self>, do_recv: Receiver<()>, kill_recv: Receiver<()>) {
@@ -81,9 +81,9 @@ impl SampleStateMachineImpl {
             match op.index() {
                 i if i == op_do => {
                     op.recv(&do_recv).unwrap();
-                    let inner = self.get_inner();
-                    let (lsn, num) = (inner.lsn, inner.num);
-                    drop(inner);
+                    let state = self.get_state();
+                    let (lsn, num) = (state.lsn, state.num);
+                    drop(state);
 
                     self.storage.save(lsn, num);
                     self.sink
@@ -101,34 +101,34 @@ impl SampleStateMachineImpl {
     }
 }
 
-pub struct SampleStateMachine(Arc<SampleStateMachineImpl>);
+pub struct SampleStateMachine(Arc<SampleStateMachineInner>);
 
 impl SampleStateMachine {
-    fn new(storage: Arc<SampleStorage>) -> Self {
-        Self(Arc::new(SampleStateMachineImpl {
-            inner: OnceCell::new().into(),
+    pub fn new(storage: Arc<SampleStorage>) -> Self {
+        Self(Arc::new(SampleStateMachineInner {
+            state: OnceCell::new().into(),
             storage,
             sink: OnceCell::new(),
         }))
     }
 
-    fn fire_persist(&self) {
+    pub fn fire_persist(&self) {
         self.0
-            .get_inner()
+            .get_state()
             .persister_do_send
             .try_send(())
             .expect("fire failed");
     }
 
-    fn get_num(&self) -> i32 {
-        self.0.get_inner().num
+    pub fn get_num(&self) -> i32 {
+        self.0.get_state().num
     }
 }
 
 impl Drop for SampleStateMachine {
     fn drop(&mut self) {
-        if let Some(inner) = self.0.try_get_inner() {
-            inner
+        if let Some(state) = self.0.try_get_state() {
+            state
                 .persister_kill_send
                 .send(())
                 .expect("kill persister failed");
@@ -154,9 +154,9 @@ impl StateMachine for SampleStateMachine {
         let (do_send, do_recv) = crossbeam::channel::bounded(1);
 
         self.0
-            .inner
+            .state
             .set(
-                SampleStateMachineInner {
+                SampleStateMachineState {
                     lsn,
                     num,
                     persister_kill_send: kill_send,
@@ -174,14 +174,14 @@ impl StateMachine for SampleStateMachine {
     }
 
     fn apply(&self, op: SampleOp, lsn: LSN) {
-        let mut inner = self.0.get_inner();
+        let mut state = self.0.get_state();
 
-        assert_eq!(inner.lsn + 1, lsn);
-        inner.lsn = lsn;
+        assert_eq!(state.lsn + 1, lsn);
+        state.lsn = lsn;
 
         match op {
             SampleOp::AddOne => {
-                inner.num += 1;
+                state.num += 1;
             }
         }
     }
@@ -195,7 +195,7 @@ mock! {
 }
 
 #[test]
-fn test_normal() {
+fn sample_sm_normal() {
     // LSN: 3, Data: 1
     let storage = Arc::new(SampleStorage::new(3, 1));
     let sm = SampleStateMachine::new(storage.clone());
@@ -251,7 +251,7 @@ fn test_normal() {
 }
 
 #[test]
-fn test_not_durable() {
+fn sample_sm_not_durable() {
     let storage = Arc::new(SampleStorage::new(3, 1));
     let sm = SampleStateMachine::new(storage.clone());
 
@@ -287,11 +287,11 @@ fn test_not_durable() {
 }
 
 #[test]
-fn test_logged_normal() -> Result<()> {
+fn logged_sample_sm_normal() -> Result<()> {
     let storage = Arc::new(SampleStorage::new(3, 1));
 
     let sm = SampleStateMachine::new(storage.clone());
-    let mut mem_log = MemLogStorage::new();
+    let mut mem_log = MemLogStorage::new(Duration::from_secs(0));
     let logged = Logged::new(sm, LogCtx::memory(&mut mem_log))?;
 
     logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: true });
@@ -306,6 +306,7 @@ fn test_logged_normal() -> Result<()> {
     logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: true });
     assert_eq!(logged.get_num(), 6);
 
+    logged.fire_persist();
     sleep(PERSISTER_TEST_WAIT);
 
     {
@@ -318,11 +319,63 @@ fn test_logged_normal() -> Result<()> {
 }
 
 #[test]
-fn test_logged_durable() -> Result<()> {
+fn logged_sample_sm_sync_durable() -> Result<()> {
     let storage = Arc::new(SampleStorage::new(3, 1));
-    let sm = SampleStateMachine::new(storage.clone());
-    let mut mem_log = MemLogStorage::new();
-    let logged = Logged::new(sm, LogCtx::memory(&mut mem_log))?;
+    let mut mem_log = MemLogStorage::new(Duration::from_secs(0));
+
+    {
+        let sm = SampleStateMachine::new(storage.clone());
+        let logged = Logged::new(sm, LogCtx::memory(&mut mem_log))?;
+
+        logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: true });
+        assert_eq!(logged.get_num(), 2);
+
+        logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: true });
+        assert_eq!(logged.get_num(), 3);
+    }
+
+    {
+        let sm = SampleStateMachine::new(storage.clone());
+        let logged = Logged::new(sm, LogCtx::memory(&mut mem_log))?;
+
+        // check not persisted by sm itself
+        let (_, num) = storage.load();
+        assert_ne!(num, 3);
+
+        // check persisted by log
+        assert_eq!(logged.get_num(), 3);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn logged_sample_sm_async_lost() -> Result<()> {
+    let storage = Arc::new(SampleStorage::new(3, 1));
+    let mut mem_log = MemLogStorage::new(Duration::from_secs(0));
+
+    {
+        let sm = SampleStateMachine::new(storage.clone());
+        let logged = Logged::new(sm, LogCtx::memory(&mut mem_log))?;
+
+        logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: false });
+        assert_eq!(logged.get_num(), 2);
+
+        logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: false });
+        assert_eq!(logged.get_num(), 3);
+    }
+
+    {
+        let sm = SampleStateMachine::new(storage.clone());
+        let logged = Logged::new(sm, LogCtx::memory(&mut mem_log))?;
+
+        // check not persisted by sm itself
+        let (_, num) = storage.load();
+        assert_ne!(num, 3);
+
+        // check not persisted by log
+        assert_ne!(logged.get_num(), 3);
+    }
 
     Ok(())
 }

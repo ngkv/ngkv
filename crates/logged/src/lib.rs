@@ -1,4 +1,5 @@
-mod log;
+mod log_ctx;
+mod log_mem;
 mod state_machine;
 #[cfg(test)]
 mod tests;
@@ -6,7 +7,7 @@ mod tests;
 use anyhow::Result;
 
 // crate
-use crate::{log::*, state_machine::*};
+pub use crate::{log_ctx::*, log_mem::*, state_machine::*};
 
 // std
 use std::{
@@ -32,20 +33,22 @@ struct PendingApply {
     cond: Condvar,
 }
 
-struct LoggedImpl<Op> {
+struct LoggedState<Op> {
     next_lsn: LSN,
     log_write: Box<dyn LogWrite<Op>>,
     log_discard: Box<dyn LogDiscard>,
     pending_applies: VecDeque<Arc<PendingApply>>,
 }
 
-pub struct Logged<S: StateMachine> {
-    imp: Mutex<LoggedImpl<S::Op>>,
+struct LoggedInner<S: StateMachine> {
+    state: Mutex<LoggedState<S::Op>>,
     sm: S,
 }
 
+pub struct Logged<S: StateMachine>(Arc<LoggedInner<S>>);
+
 struct ReportSinkImpl<S: StateMachine> {
-    logged: Weak<Logged<S>>,
+    logged: Weak<LoggedInner<S>>,
 }
 
 impl<S: StateMachine> ReportSink for ReportSinkImpl<S> {
@@ -53,8 +56,8 @@ impl<S: StateMachine> ReportSink for ReportSinkImpl<S> {
         // update (highest included) snapshot lsn
         // which could be safely discarded
         let this = Weak::upgrade(&self.logged).expect("already destroyed");
-        let mut lck = this.imp.lock().unwrap();
-        lck.log_discard.discard(lsn);
+        let mut state = this.state.lock().unwrap();
+        state.log_discard.discard(lsn);
     }
 }
 
@@ -66,15 +69,30 @@ impl<S: StateMachine> Deref for Logged<S> {
     type Target = S;
 
     fn deref(&self) -> &Self::Target {
-        &self.sm
+        &self.0.sm
+    }
+}
+
+impl<S: StateMachine> LoggedInner<S> {
+    fn finalize_pending(&self, lsn: LSN) {
+        let mut state = self.state.lock().unwrap();
+        while let Some(p) = state.pending_applies.front() {
+            if p.lsn > lsn {
+                break;
+            }
+
+            p.done.store(true, Ordering::Relaxed);
+            p.cond.notify_one();
+            state.pending_applies.pop_front();
+        }
     }
 }
 
 impl<S: StateMachine> Logged<S> {
-    pub fn new(sm: S, log_ctx: LogCtx<S::Op>) -> Result<Arc<Self>> {
-        let this = Arc::new(Self {
+    pub fn new(sm: S, log_ctx: LogCtx<S::Op>) -> Result<Self> {
+        let this = Arc::new(LoggedInner {
             sm,
-            imp: Mutex::new(LoggedImpl {
+            state: Mutex::new(LoggedState {
                 next_lsn: 1,
                 log_write: log_ctx.write,
                 log_discard: log_ctx.discard,
@@ -93,43 +111,32 @@ impl<S: StateMachine> Logged<S> {
         assert!(next_lsn >= 1);
 
         {
-            // set next_lsn & replay log
-            let mut lck = this.imp.lock().unwrap();
-            lck.next_lsn = next_lsn;
+            // set next_lsn
+            let mut state = this.state.lock().unwrap();
+            state.next_lsn = next_lsn;
+
+            // replay log
             let mut log_read = log_ctx.read;
             for (op, lsn) in log_read.read(next_lsn)? {
-                assert_eq!(lsn, lck.next_lsn);
-                this.sm.apply(op, lck.next_lsn);
-                lck.next_lsn += 1;
+                assert_eq!(lsn, state.next_lsn);
+                this.sm.apply(op, state.next_lsn);
+                state.next_lsn += 1;
             }
 
             // set sink for log writer sync
-            lck.log_write.set_sync_sink(Box::new(move |lsn| {
+            state.log_write.init(Box::new(move |lsn| {
                 let this = this_weak.upgrade().expect("already destroyed");
                 this.finalize_pending(lsn);
             }));
         }
 
-        Ok(this)
-    }
-
-    fn finalize_pending(&self, lsn: LSN) {
-        let mut lck = self.imp.lock().unwrap();
-        while let Some(p) = lck.pending_applies.front() {
-            if p.lsn > lsn {
-                break;
-            }
-
-            p.done.store(true, Ordering::Release);
-            p.cond.notify_one();
-            lck.pending_applies.pop_front();
-        }
+        Ok(Logged(this))
     }
 
     pub fn apply(&self, op: S::Op, options: ApplyOptions) {
-        let mut lck = self.imp.lock().unwrap();
-        let lsn = lck.next_lsn;
-        lck.next_lsn += 1;
+        let mut state = self.0.state.lock().unwrap();
+        let lsn = state.next_lsn;
+        state.next_lsn += 1;
 
         // NOTE:
         // we must set pending apply before fire_write
@@ -141,19 +148,19 @@ impl<S: StateMachine> Logged<S> {
                 cond: Condvar::new(),
             });
             cur_pending = Some(pending.clone());
-            lck.pending_applies.push_back(pending);
+            state.pending_applies.push_back(pending);
         }
 
-        lck.log_write.fire_write(&op, lsn);
+        state.log_write.fire_write(&op, lsn);
 
         if options.is_sync {
             // cur_pending must be Some
             let pending = cur_pending.unwrap();
-            while pending.done.load(Ordering::Acquire) {
-                lck = pending.cond.wait(lck).unwrap();
+            while pending.done.load(Ordering::Relaxed) {
+                state = pending.cond.wait(state).unwrap();
             }
         }
 
-        self.sm.apply(op, lsn)
+        self.0.sm.apply(op, lsn)
     }
 }
