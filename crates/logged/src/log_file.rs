@@ -1,16 +1,18 @@
 use std::{
     cmp::Ord,
     fs::{read_dir, OpenOptions},
-    io::BufReader,
+    hash,
+    io::{BufReader, Cursor, Read},
     marker::PhantomData,
-    ops::RangeInclusive,
     path::{Path, PathBuf},
+    ptr::hash,
     todo,
 };
 
 use anyhow::{anyhow, ensure, Result};
-use itertools::Itertools;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use byteorder::{LittleEndian, ReadBytesExt};
+use crc32fast::Hasher;
+use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{LogCtx, LogRead, LSN};
 
@@ -18,14 +20,72 @@ pub struct FileLogStorage<Op> {
     _op: PhantomData<Op>,
 }
 
-#[derive(Serialize, Deserialize)]
+// Physical Representation of LogEntry:
+// Magic 0xef: u8
+// Checksum (of later fields): u32
+// Type: u8
+// Payload length: u32
+// Payload: [u8]
 struct LogEntry<Op> {
     lsn: LSN,
     op: Op,
 }
 
+const MAGIC: u8 = 0xef;
+
+#[repr(u8)]
+enum LogEntryType {
+    Normal = 0,
+}
+
+struct Crc32Read<R> {
+    inner: R,
+    hasher: crc32fast::Hasher,
+}
+
+impl<R> Crc32Read<R> {
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: crc32fast::Hasher::new(),
+        }
+    }
+
+    pub fn finalize(self) -> u32 {
+        self.hasher.finalize()
+    }
+}
+
+impl<R: Read> Read for Crc32Read<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+}
+
 // Read entry never fails. Corrupted entry & all entries after it are discarded.
-fn read_entry<Op>(read: impl std::io::Read) -> Option<LogEntry<Op>> {
+fn read_entry<Op>(mut reader: impl Read) -> Option<LogEntry<Op>> {
+    let result = || -> Result<()> {
+        let magic = reader.read_u8()?;
+        ensure!(magic == MAGIC, "magic mismatch");
+
+        let crc = reader.read_u32::<LittleEndian>()?;
+
+        // Following reads would be covered by CRC.
+        let mut reader_crc = Crc32Read::new(&mut reader);
+        let typ = reader_crc.read_u8()?;
+        let payload_len = reader_crc.read_u32::<LittleEndian>()?;
+        let mut payload_buf = vec![0 as u8; payload_len as usize];
+        reader_crc.read_exact(&mut payload_buf)?;
+
+        // Compare CRC value.
+        let crc_actual = reader_crc.finalize();
+        ensure!(crc_actual == crc, "crc mismatch");
+
+        Ok(())
+    }();
+
     todo!()
 }
 
@@ -36,18 +96,19 @@ fn write_entry<Op>(write: impl std::io::Write, entry: LogEntry<Op>) -> Result<()
 // Log File Name Format
 // log-{start}-{end}
 
-fn parse_file_name(name: &str) -> Result<RangeInclusive<LSN>> {
+// Return start LSN
+fn parse_file_name(name: &str) -> Result<LSN> {
     let fields = name.split("-").collect::<Vec<_>>();
     ensure!(
-        fields.len() == 3 && fields[0] == "log",
+        fields.len() == 2 && fields[0] == "log",
         "invalid log filename"
     );
 
-    Ok(RangeInclusive::new(fields[1].parse()?, fields[2].parse()?))
+    Ok(fields[1].parse()?)
 }
 
-fn make_file_name(range: RangeInclusive<LSN>) -> String {
-    format!("log-{}-{}", range.start(), range.end())
+fn make_file_name(start_lsn: LSN) -> String {
+    format!("log-{}", start_lsn)
 }
 
 struct ReadLogIter<R, Op> {
@@ -57,7 +118,7 @@ struct ReadLogIter<R, Op> {
 
 impl<R, Op> Iterator for ReadLogIter<R, Op>
 where
-    R: std::io::Read,
+    R: Read,
     Op: DeserializeOwned,
 {
     type Item = (Op, LSN);
@@ -69,7 +130,7 @@ where
 }
 
 struct FileInfo {
-    lsn_range: RangeInclusive<LSN>,
+    start_lsn: LSN,
     file: std::fs::File,
 }
 
@@ -83,19 +144,6 @@ impl FileInfo {
             reader,
             _op: PhantomData::default(),
         }
-    }
-}
-
-struct LogIter<Op> {
-    logs: Vec<FileInfo>,
-    _op: PhantomData<Op>,
-}
-
-impl<Op> Iterator for LogIter<Op> {
-    type Item = (Op, LSN);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        todo!()
     }
 }
 
@@ -116,27 +164,33 @@ where
             let ent = ent?;
             let os_name = ent.file_name();
             let name = os_name.to_str().ok_or(anyhow!("invalid log filename"))?;
-            let range = parse_file_name(name)?;
-            if *range.end() >= start {
-                files.push(FileInfo {
-                    lsn_range: range,
-                    file: OpenOptions::new().read(true).open(ent.path())?,
-                });
-            }
+            let start_lsn = parse_file_name(name)?;
+            files.push(FileInfo {
+                start_lsn,
+                file: OpenOptions::new().read(true).open(ent.path())?,
+            });
         }
 
         // Sort them by ascending order.
-        files.sort_by(|a, b| Ord::cmp(&a.lsn_range.start(), &b.lsn_range.start()));
+        files.sort_by(|a, b| Ord::cmp(&a.start_lsn, &b.start_lsn));
 
-        // Ensure consecutive LSN among log files.
-        let consecutive = files
-            .iter()
-            .tuple_windows()
-            .all(|(cur, next)| *cur.lsn_range.end() + 1 == *next.lsn_range.start());
-        ensure!(consecutive, "log is not consecutive");
+        let (higher, lower): (Vec<_>, Vec<_>) =
+            files.into_iter().partition(|f| f.start_lsn >= start);
+
+        // Related log files consists two parts:
+        // 1. Last log file with lower start LSN, if exists.
+        // 2. All log files with higher start LSN.
+        let mut related_files = vec![];
+        if !lower.is_empty() {
+            let mut lower = lower;
+            related_files.push(lower.remove(lower.len() - 1));
+        }
+        related_files.extend(higher);
 
         // Iterate over files, flat map logs.
-        Ok(Box::new(files.into_iter().flat_map(|f| f.iter_logs())))
+        Ok(Box::new(
+            related_files.into_iter().flat_map(|f| f.iter_logs()),
+        ))
     }
 }
 

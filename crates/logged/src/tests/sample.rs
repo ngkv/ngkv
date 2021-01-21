@@ -303,6 +303,8 @@ fn logged_sample_sm_normal() -> Result<()> {
     logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: true });
     assert_eq!(logged.get_num(), 3);
 
+    assert_eq!(mem_log.len(), 2);
+
     logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: false });
     logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: false });
 
@@ -311,6 +313,8 @@ fn logged_sample_sm_normal() -> Result<()> {
 
     logged.fire_persist();
     sleep(PERSISTER_TEST_WAIT);
+
+    assert_eq!(mem_log.len(), 0);
 
     {
         let (lsn, num) = storage.load();
