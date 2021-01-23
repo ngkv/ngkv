@@ -1,7 +1,6 @@
 use std::{
-    cmp::Ord,
+    cmp::{max, Ord},
     convert::TryFrom,
-    fmt::write,
     fs::{read_dir, File, OpenOptions},
     io::{BufReader, BufWriter, Read, Write},
     marker::PhantomData,
@@ -12,25 +11,24 @@ use std::{
     },
     thread::{spawn, JoinHandle},
     time::{Duration, Instant},
-    todo,
 };
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use crossbeam::channel::unbounded;
 use once_cell::sync::OnceCell;
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     crc32_io::{Crc32Read, Crc32Write},
-    log_ctx, LogCtx, LogRead, LogWrite, LogWriteOptions, LSN,
+    LogCtx, LogDiscard, LogRead, LogWrite, LogWriteOptions, LSN,
 };
 
 #[derive(Clone)]
 pub struct FileLogOptions {
     pub dir: PathBuf,
     pub sync_policy: FileSyncPolicy,
-    pub log_size: u64,
+    pub log_step_size: u64,
+    pub log_switch_size: u64,
 }
 
 #[derive(Clone)]
@@ -107,16 +105,21 @@ fn read_record<Op: DeserializeOwned>(mut reader: impl Read) -> Option<Op> {
 
 enum WriteRecordStatus {
     Done(u64),          // Write record succeeded. Return how many bytes have been written.
-    NoEnoughSpace(u64), // No enouph space in log file. Caller could switch or enlarge file.
+    NoEnoughSpace(u64), // No enouph space in log file. Return how many bytes this record would take.
+}
+
+// Serialize an op. Works together with write_record.
+fn serialize_op<Op: Serialize>(op: &Op) -> Result<Vec<u8>> {
+    let buf = bincode::serialize(op)?;
+    Ok(buf)
 }
 
 // Write a record to writer.
-fn write_record<Op: Serialize>(
+fn write_record(
     mut writer: impl Write,
     space_remain: u64,
-    op: Op,
+    payload_buf: &[u8],
 ) -> Result<WriteRecordStatus> {
-    let payload_buf = bincode::serialize(&op)?;
     let space = 10 + payload_buf.len() as u64;
     if space > space_remain {
         return Ok(WriteRecordStatus::NoEnoughSpace(space));
@@ -254,9 +257,10 @@ where
 //     force_sync: bool,
 // }
 
-struct SingleFilePendingState {
+struct SingleLogFile {
+    written: u64,
     writer: BufWriter<File>,
-    file: File,
+    fd: File,
     size: u64,
     request_force_sync: bool,
     sync_lsn: LSN,
@@ -269,9 +273,8 @@ struct WriteSyncState {
 
     // cur_writer: BufWriter<File>,
     // cur_pendings: VecDeque<PendingWrite<Op>>,
-    cur_written: u64,
-    cur_file: SingleFilePendingState,
-    prev_file: Option<SingleFilePendingState>,
+    cur_file: SingleLogFile,
+    // prev_file: Option<SingleFilePendingState>,
     // cur_pendings: VecDeque<PendingWrite<Op>>,
     // prev_file: Option<File>,
     // prev_pendings: Option<VecDeque<PendingWrite<Op>>>,
@@ -296,33 +299,31 @@ impl<Op> WriteInner<Op>
 where
     Op: Send + Sync + Clone + Serialize + 'static,
 {
-    fn open_log(start_lsn: LSN, options: &FileLogOptions) -> Result<File> {
+    fn open_log_file(start_lsn: LSN, options: &FileLogOptions) -> Result<SingleLogFile> {
         let path = make_file_name(start_lsn);
-        let file = OpenOptions::new().append(true).truncate(true).open(path)?;
-        file.set_len(options.log_size)?;
-        Ok(file)
+        let file = OpenOptions::new().write(true).truncate(true).open(path)?;
+        file.set_len(options.log_step_size)?;
+
+        Ok(SingleLogFile {
+            written: 0,
+            writer: BufWriter::new(file.try_clone()?),
+            fd: file,
+            pending_lsn: 0,
+            sync_lsn: 0,
+            size: options.log_step_size,
+            request_force_sync: false,
+        })
     }
 
-    fn iter_file_pending(
-        state: &WriteSyncState,
-    ) -> impl '_ + Iterator<Item = &SingleFilePendingState> {
-        state
-            .prev_file
-            .iter()
-            .chain(std::iter::once(&state.cur_file))
+    fn enlarge_log_file(file: &mut SingleLogFile, size: u64) -> Result<()> {
+        file.fd.set_len(size)?;
+        file.size = size;
+        Ok(())
     }
 
-    fn iter_file_pending_mut(
-        state: &mut WriteSyncState,
-    ) -> impl '_ + Iterator<Item = &mut SingleFilePendingState> {
-        state
-            .prev_file
-            .iter_mut()
-            .chain(std::iter::once(&mut state.cur_file))
-    }
-
-    // Wait for kill or periodic sync.
-    fn wait_for_kill_or_periodic_sync<'a>(
+    // Wait for kill or sync. Sync is only possible while there are pending
+    // writes.
+    fn wait_for_kill_or_sync<'a>(
         sync: &WriteSyncShared,
         mut state: MutexGuard<'a, WriteSyncState>,
     ) -> MutexGuard<'a, WriteSyncState> {
@@ -331,13 +332,12 @@ where
             let now = Instant::now();
 
             // Any pending write?
-            if Self::iter_file_pending(&*state).any(|f| f.pending_lsn > f.sync_lsn) {
+            if state.cur_file.pending_lsn > state.cur_file.sync_lsn {
                 // We have pending writes. Sync them when:
                 // 1. Asked by the write options (i.e. force_sync flag).
                 // 2. Asked by the periodical sync policy.
                 let case_sync_time = || now >= next_sync_time;
-                let case_force_sync =
-                    || Self::iter_file_pending(&*state).any(|f| f.request_force_sync);
+                let case_force_sync = || state.cur_file.request_force_sync;
                 if case_sync_time() || case_force_sync() {
                     // We should sync now.
                     break;
@@ -355,30 +355,33 @@ where
     }
 
     fn do_sync(sync: &WriteSyncShared, mut state: MutexGuard<WriteSyncState>) -> Result<()> {
-        let mut prev_lsn = 0;
-        let mut file_lsn_tups = vec![];
-        for p in Self::iter_file_pending_mut(&mut *state) {
-            p.request_force_sync = false;
-            p.sync_lsn = p.pending_lsn;
-            p.writer.flush()?;
-            file_lsn_tups.push((p.file.try_clone()?, p.pending_lsn));
+        let sync_fd = state.cur_file.fd.try_clone()?;
+        let sync_lsn = state.cur_file.pending_lsn;
 
-            // Sanity check file iterate order. Old log file must comes first.
-            assert!(p.pending_lsn >= prev_lsn);
-            prev_lsn = p.pending_lsn;
+        // Sanity check: Are there any pending writes?
+        assert!(state.cur_file.pending_lsn > state.cur_file.sync_lsn);
+
+        // Update state for sync before unlocking. This does no harm, since we
+        // notify the external world by calling the sync sink, and it happens
+        // after the actual sync.
+        state.cur_file.request_force_sync = false;
+        state.cur_file.sync_lsn = state.cur_file.pending_lsn;
+        state.cur_file.writer.flush()?;
+
+        // Check if we should switch log file.
+        if state.cur_file.size >= sync.options.log_switch_size {
+            assert_ne!(state.cur_file.pending_lsn, 0);
+            let new_file = Self::open_log_file(state.cur_file.pending_lsn + 1, &sync.options)?;
+            let _old = std::mem::replace(&mut state.cur_file, new_file);
         }
-
-        // Forget about previous log file if exists. Log switching is done.
-        state.prev_file.take();
 
         // Unlock before syncing.
         drop(state);
 
-        // No race here, because we are in the only sync thread.
-        for (f, lsn) in file_lsn_tups {
-            f.sync_all()?;
-            (sync.sink)(lsn);
-        }
+        // Sync & notify external world. No race here because we are in the only
+        // sync thread.
+        sync_fd.sync_all()?;
+        (sync.sink)(sync_lsn);
 
         Ok(())
     }
@@ -395,7 +398,7 @@ where
                     }
 
                     loop {
-                        state = Self::wait_for_kill_or_periodic_sync(&*sync, state);
+                        state = Self::wait_for_kill_or_sync(&*sync, state);
 
                         // Killed?
                         if sync.killed.load(Ordering::Relaxed) {
@@ -429,21 +432,11 @@ where
         sink: Box<dyn Send + Sync + Fn(LSN)>,
         options: FileLogOptions,
     ) -> Result<Self> {
-        let file = Self::open_log(start_lsn, &options)?;
-        let writer = BufWriter::new(file.try_clone()?);
+        let cur_file = Self::open_log_file(start_lsn, &options)?;
 
         let state = WriteSyncState {
             next_sync_time: None,
-            prev_file: None,
-            cur_file: SingleFilePendingState {
-                file,
-                writer,
-                size: options.log_size,
-                pending_lsn: 0,
-                sync_lsn: 0,
-                request_force_sync: false,
-            },
-            cur_written: 0,
+            cur_file,
         };
 
         let shared = Arc::new(WriteSyncShared {
@@ -463,6 +456,9 @@ where
     }
 
     fn fire_write(&mut self, op: &Op, lsn: LSN, options: &LogWriteOptions) -> Result<()> {
+        // Serialize ahead of time to avoid duplicated serialization.
+        let op_buf = serialize_op(op)?;
+
         loop {
             let failed = self.sync_shared.failed.load(Ordering::Acquire);
             if failed {
@@ -476,40 +472,21 @@ where
             }
 
             let mut state = self.sync_shared.state.lock().unwrap();
-            let space_remain = self.sync_shared.options.log_size - state.cur_written;
-            let status = write_record(&mut state.cur_file.writer, space_remain, op)?;
+            let space_remain = state.cur_file.size - state.cur_file.written;
+            let status = write_record(&mut state.cur_file.writer, space_remain, &op_buf)?;
             match status {
                 WriteRecordStatus::Done(written) => {
-                    state.cur_written += written;
+                    state.cur_file.written += written;
                     state.cur_file.pending_lsn = lsn;
                     state.cur_file.request_force_sync |= options.force_sync;
                     break;
                 }
                 WriteRecordStatus::NoEnoughSpace(space) => {
-                    ensure!(
-                        space <= self.sync_shared.options.log_size,
-                        "op larger than log size is currently not supported"
+                    let target_size = max(
+                        state.cur_file.size + self.sync_shared.options.log_step_size,
+                        state.cur_file.written + space,
                     );
-
-                    // Switch file.
-
-                    while state.prev_file.is_some() {
-                        // TODO: wait prev file sync
-                    }
-
-                    assert!(state.prev_file.is_none());
-                    let file = Self::open_log(lsn, &self.sync_shared.options)?;
-                    let new_file = SingleFilePendingState {
-                        writer: BufWriter::new(file.try_clone()?),
-                        file,
-                        pending_lsn: 0,
-                        sync_lsn: 0,
-                        size: self.sync_shared.options.log_size,
-                        request_force_sync: false,
-                    };
-
-                    let old_cur_file = std::mem::replace(&mut state.cur_file, new_file);
-                    state.prev_file = Some(old_cur_file);
+                    Self::enlarge_log_file(&mut state.cur_file, target_size)?;
                 }
             }
         }
@@ -546,11 +523,20 @@ where
         Ok(())
     }
 
-    fn fire_write(&mut self, op: &Op, lsn: LSN, options: &LogWriteOptions) {
+    fn fire_write(&mut self, op: &Op, lsn: LSN, options: &LogWriteOptions) -> Result<()> {
         self.inner
             .get_mut()
             .expect("not init")
-            .fire_write(op, lsn, options);
+            .fire_write(op, lsn, options)
+    }
+}
+
+struct DiscardImpl {}
+
+impl LogDiscard for DiscardImpl {
+    fn fire_discard(&mut self, _lsn: LSN) -> Result<()> {
+        // TODO: implement log discard
+        Ok(())
     }
 }
 
@@ -564,8 +550,11 @@ where
                 dir: options.dir.clone(),
                 _op: PhantomData::default(),
             }),
-            write: todo!(),
-            discard: todo!(),
+            write: Box::new(WriteImpl {
+                inner: OnceCell::new(),
+                options: Some(options.clone()),
+            }),
+            discard: Box::new(DiscardImpl {}),
         }
     }
 }

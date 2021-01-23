@@ -12,11 +12,11 @@ pub struct LogWriteOptions {
 
 pub trait LogWrite<Op>: Send + Sync {
     fn init(&mut self, start_lsn: LSN, sink: Box<dyn Send + Sync + Fn(LSN)>) -> Result<()>;
-    fn fire_write(&mut self, op: &Op, lsn: LSN, options: &LogWriteOptions); // NOTE: this is fire and forgot
+    fn fire_write(&mut self, op: &Op, lsn: LSN, options: &LogWriteOptions) -> Result<()>; // NOTE: this is fire and forgot
 }
 
 pub trait LogDiscard: Send + Sync {
-    fn fire_discard(&mut self, lsn: LSN);
+    fn fire_discard(&mut self, lsn: LSN) -> Result<()>;
 }
 
 pub struct LogCtx<Op> {

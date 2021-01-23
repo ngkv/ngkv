@@ -59,7 +59,9 @@ impl<S: StateMachine> ReportSink for ReportSinkImpl<S> {
         // which could be safely discarded
         let this = Weak::upgrade(&self.logged).expect("already destroyed");
         let mut state = this.state.lock().unwrap();
-        state.log_discard.fire_discard(lsn);
+
+        // TODO handle discard error
+        state.log_discard.fire_discard(lsn).expect("error handling not supported");
     }
 }
 
@@ -157,13 +159,17 @@ impl<S: StateMachine> Logged<S> {
             state.pending_applies.push_back(pending);
         }
 
-        state.log_write.fire_write(
-            &op,
-            lsn,
-            &LogWriteOptions {
-                force_sync: options.is_sync,
-            },
-        );
+        // TODO handle log write error
+        state
+            .log_write
+            .fire_write(
+                &op,
+                lsn,
+                &LogWriteOptions {
+                    force_sync: options.is_sync,
+                },
+            )
+            .expect("error handling not supported");
 
         if options.is_sync {
             // cur_pending must be Some
