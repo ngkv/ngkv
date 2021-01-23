@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{LogCtx, LogDiscard, LogRead, LogWrite, LSN};
+use crate::{LogCtx, LogDiscard, LogRead, LogWrite, LogWriteOptions, LSN};
 use anyhow::Result;
 use once_cell::sync::OnceCell;
 use smart_default::SmartDefault;
@@ -48,7 +48,6 @@ struct StorageShared<Op> {
 #[derive(SmartDefault)]
 struct SyncShared<Op> {
     pendings: Mutex<VecDeque<PendingLog<Op>>>,
-    thread: Mutex<Option<JoinHandle<()>>>,
     sink: OnceCell<Box<dyn Send + Sync + Fn(LSN)>>,
     killed: AtomicBool,
     cond: Condvar,
@@ -67,6 +66,7 @@ impl<Op> ReadDiscardImpl<Op> {
 // LOCK ORDER: sync, stor
 struct WriteImpl<Op> {
     sync: Arc<SyncShared<Op>>,
+    _sync_thread: JoinHandle<()>,
     stor: Arc<StorageShared<Op>>,
 }
 
@@ -75,9 +75,8 @@ impl<Op> Drop for WriteImpl<Op> {
         self.sync.killed.store(true, Ordering::Relaxed);
         self.sync.cond.notify_one();
 
-        // Join thread here. This ensures that sync sink would not be called
-        // after drop.
-        let _thread = self.sync.thread.lock().unwrap().take();
+        // Join thread here (by dropping _sync_thread). This ensures that sync
+        // sink would not be called after drop.
     }
 }
 
@@ -141,8 +140,11 @@ impl<Op> WriteImpl<Op> {
             }
         });
 
-        *sync.thread.lock().unwrap() = Some(thread);
-        Self { sync, stor }
+        Self {
+            sync,
+            stor,
+            _sync_thread: thread,
+        }
     }
 }
 
@@ -150,22 +152,22 @@ impl<Op> LogWrite<Op> for WriteImpl<Op>
 where
     Op: Send + Sync + Clone + 'static,
 {
-    fn init(&mut self, sink: Box<dyn Send + Sync + Fn(LSN)>) {
+    fn init(&mut self, _start_lsn: LSN, sink: Box<dyn Send + Sync + Fn(LSN)>) -> Result<()> {
         self.sync
             .sink
             .set(sink)
             .map_err(|_| ())
             .expect("already init");
+        Ok(())
     }
 
-    fn fire_write(&mut self, op: &Op, lsn: LSN) {
+    fn fire_write(&mut self, op: &Op, lsn: LSN, options: &LogWriteOptions) {
         let mut pendings = self.sync.pendings.lock().unwrap();
         pendings.push_back(PendingLog {
             lsn,
             op: op.clone(),
             sync_time: Instant::now() + self.stor.sync_delay,
         });
-
         self.sync.cond.notify_one();
     }
 }
@@ -221,7 +223,7 @@ mod tests {
 
     use anyhow::Result;
 
-    use crate::{check_non_blocking, LogCtx, MemLogStorage, LSN};
+    use crate::{check_non_blocking, LogCtx, LogWriteOptions, MemLogStorage, LSN};
 
     #[derive(Clone, Eq, PartialEq, Debug)]
     struct TestOp {
@@ -229,15 +231,18 @@ mod tests {
     }
 
     #[test]
-    fn mem_log_normal() {
+    fn mem_log_normal() -> Result<()> {
         let mut stor = MemLogStorage::new(Duration::from_millis(50));
 
         let mut ctx = LogCtx::<TestOp>::memory(&mut stor);
         let (send, recv) = crossbeam::channel::bounded(0);
 
-        ctx.write.init(Box::new(move |lsn| {
-            send.send(lsn).unwrap();
-        }));
+        ctx.write.init(
+            1,
+            Box::new(move |lsn| {
+                send.send(lsn).unwrap();
+            }),
+        )?;
 
         let mut cur_lsn = 0;
         let cur_lsn_ref = &mut cur_lsn;
@@ -247,8 +252,14 @@ mod tests {
             }
         };
 
-        check_non_blocking(|| ctx.write.fire_write(&TestOp { no: 1 }, 1));
-        check_non_blocking(|| ctx.write.fire_write(&TestOp { no: 2 }, 2));
+        check_non_blocking(|| {
+            ctx.write
+                .fire_write(&TestOp { no: 1 }, 1, &LogWriteOptions::default())
+        });
+        check_non_blocking(|| {
+            ctx.write
+                .fire_write(&TestOp { no: 2 }, 2, &LogWriteOptions::default())
+        });
 
         expect_lsn_sync(2);
 
@@ -268,17 +279,21 @@ mod tests {
             let read_res = ctx.read.read(0).unwrap().collect::<Vec<_>>();
             assert_eq!(read_res, vec![(TestOp { no: 2 }, 2)]);
         }
+
+        Ok(())
     }
 
     #[test]
-    fn mem_log_drop_no_sync() {
+    fn mem_log_drop_no_sync() -> Result<()> {
         let mut stor = MemLogStorage::new(Duration::from_millis(50));
 
         {
             let mut ctx = LogCtx::<TestOp>::memory(&mut stor);
-            ctx.write.init(Box::new(|_| {}));
-            ctx.write.fire_write(&TestOp { no: 1 }, 1);
-            ctx.write.fire_write(&TestOp { no: 2 }, 2);
+            ctx.write.init(1, Box::new(|_| {}))?;
+            ctx.write
+                .fire_write(&TestOp { no: 1 }, 1, &LogWriteOptions::default());
+            ctx.write
+                .fire_write(&TestOp { no: 2 }, 2, &LogWriteOptions::default());
         }
 
         // wait at least sync_delay
@@ -289,6 +304,8 @@ mod tests {
             let read_res = ctx.read.read(0).unwrap().collect::<Vec<_>>();
             assert_eq!(read_res, vec![]);
         }
+
+        Ok(())
     }
 
     #[test]
@@ -299,9 +316,12 @@ mod tests {
             let mut ctx = LogCtx::<TestOp>::memory(&mut stor);
             let (send, recv) = crossbeam::channel::bounded(0);
 
-            ctx.write.init(Box::new(move |lsn| {
-                send.send(lsn).unwrap();
-            }));
+            ctx.write.init(
+                4,
+                Box::new(move |lsn| {
+                    send.send(lsn).unwrap();
+                }),
+            )?;
 
             let mut cur_lsn = 0;
             let cur_lsn_ref = &mut cur_lsn;
@@ -311,8 +331,14 @@ mod tests {
                 }
             };
 
-            check_non_blocking(|| ctx.write.fire_write(&TestOp { no: 4 }, 4));
-            check_non_blocking(|| ctx.write.fire_write(&TestOp { no: 5 }, 5));
+            check_non_blocking(|| {
+                ctx.write
+                    .fire_write(&TestOp { no: 4 }, 4, &LogWriteOptions::default())
+            });
+            check_non_blocking(|| {
+                ctx.write
+                    .fire_write(&TestOp { no: 5 }, 5, &LogWriteOptions::default())
+            });
 
             expect_lsn_sync(5);
 

@@ -1,3 +1,4 @@
+mod crc32_io;
 mod log_ctx;
 mod log_file;
 mod log_mem;
@@ -125,10 +126,14 @@ impl<S: StateMachine> Logged<S> {
             }
 
             // set sink for log writer sync
-            state.log_write.init(Box::new(move |lsn| {
-                let this = this_weak.upgrade().expect("already destroyed");
-                this.finalize_pending(lsn);
-            }));
+            let next_lsn = state.next_lsn;
+            state.log_write.init(
+                next_lsn,
+                Box::new(move |lsn| {
+                    let this = this_weak.upgrade().expect("already destroyed");
+                    this.finalize_pending(lsn);
+                }),
+            )?;
         }
 
         Ok(Logged(this))
@@ -152,7 +157,13 @@ impl<S: StateMachine> Logged<S> {
             state.pending_applies.push_back(pending);
         }
 
-        state.log_write.fire_write(&op, lsn);
+        state.log_write.fire_write(
+            &op,
+            lsn,
+            &LogWriteOptions {
+                force_sync: options.is_sync,
+            },
+        );
 
         if options.is_sync {
             // cur_pending must be Some
