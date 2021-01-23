@@ -1,10 +1,10 @@
 use std::{
     cmp::{max, Ord},
     convert::TryFrom,
-    fs::{read_dir, File, OpenOptions},
+    fs::{read_dir, remove_file, File, OpenOptions},
     io::{BufReader, BufWriter, Read, Write},
     marker::PhantomData,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Condvar, Mutex, MutexGuard,
@@ -15,6 +15,7 @@ use std::{
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use itertools::Itertools;
 use once_cell::sync::OnceCell;
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -59,6 +60,28 @@ impl TryFrom<u8> for LogEntryType {
             x => Err(anyhow!("invalid log entry type {}", x)),
         }
     }
+}
+
+// Read all log files from a directory. Files are ordered by start lsn.
+fn read_dir_logs(dir: &Path) -> Result<Vec<FileInfo>> {
+    // Find log files we interested in.
+    let mut files = vec![];
+    for ent in read_dir(dir)? {
+        let ent = ent?;
+        let os_name = ent.file_name();
+        let name = os_name.to_str().ok_or(anyhow!("invalid log filename"))?;
+        let start_lsn = parse_file_name(name)?;
+        files.push(FileInfo {
+            start_lsn,
+            path: ent.path(),
+            file: OpenOptions::new().read(true).open(ent.path())?,
+        });
+    }
+
+    // Sort them by ascending order.
+    files.sort_by(|a, b| Ord::cmp(&a.start_lsn, &b.start_lsn));
+
+    Ok(files)
 }
 
 // Read a record from reader.
@@ -187,7 +210,8 @@ where
 
 struct FileInfo {
     start_lsn: LSN,
-    file: std::fs::File,
+    file: File,
+    path: PathBuf,
 }
 
 impl FileInfo {
@@ -214,22 +238,7 @@ where
     Op: Send + Sync + DeserializeOwned + 'static,
 {
     fn read(&mut self, start: LSN) -> Result<Box<dyn Iterator<Item = (Op, LSN)>>> {
-        let mut files = vec![];
-
-        // Find log files we interested in.
-        for ent in read_dir(&self.dir)? {
-            let ent = ent?;
-            let os_name = ent.file_name();
-            let name = os_name.to_str().ok_or(anyhow!("invalid log filename"))?;
-            let start_lsn = parse_file_name(name)?;
-            files.push(FileInfo {
-                start_lsn,
-                file: OpenOptions::new().read(true).open(ent.path())?,
-            });
-        }
-
-        // Sort them by ascending order.
-        files.sort_by(|a, b| Ord::cmp(&a.start_lsn, &b.start_lsn));
+        let files = read_dir_logs(&self.dir)?;
 
         let (higher, lower): (Vec<_>, Vec<_>) =
             files.into_iter().partition(|f| f.start_lsn >= start);
@@ -517,11 +526,28 @@ where
     }
 }
 
-struct DiscardImpl {}
+struct DiscardImpl {
+    dir: PathBuf,
+}
 
 impl LogDiscard for DiscardImpl {
-    fn fire_discard(&mut self, _lsn: LSN) -> Result<()> {
-        // TODO: implement log discard
+    fn fire_discard(&mut self, lsn: LSN) -> Result<()> {
+        // Find all files whose start_lsn <= lsn
+        let files = read_dir_logs(&self.dir)?;
+        let mut lower = files
+            .into_iter()
+            .filter(|f| f.start_lsn <= lsn)
+            .collect_vec();
+
+        // All lower file except last one could be safely discarded.
+        if !lower.is_empty() {
+            lower.remove(lower.len() - 1);
+        }
+
+        for f in lower.into_iter() {
+            remove_file(&f.path)?;
+        }
+
         Ok(())
     }
 }
@@ -540,7 +566,9 @@ where
                 inner: OnceCell::new(),
                 options: Some(options.clone()),
             }),
-            discard: Box::new(DiscardImpl {}),
+            discard: Box::new(DiscardImpl {
+                dir: options.dir.clone(),
+            }),
         }
     }
 }
