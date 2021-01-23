@@ -147,7 +147,7 @@ fn write_record(
 }
 
 // Log File Name Format
-// log-{start}-{end}
+// log-{start}
 
 // Return start LSN
 fn parse_file_name(name: &str) -> Result<LSN> {
@@ -251,12 +251,6 @@ where
     }
 }
 
-// struct PendingWrite<Op> {
-//     op: Op,
-//     lsn: LSN,
-//     force_sync: bool,
-// }
-
 struct SingleLogFile {
     written: u64,
     writer: BufWriter<File>,
@@ -269,15 +263,7 @@ struct SingleLogFile {
 
 struct WriteSyncState {
     next_sync_time: Option<Instant>,
-    // cur_file: File,
-
-    // cur_writer: BufWriter<File>,
-    // cur_pendings: VecDeque<PendingWrite<Op>>,
     cur_file: SingleLogFile,
-    // prev_file: Option<SingleFilePendingState>,
-    // cur_pendings: VecDeque<PendingWrite<Op>>,
-    // prev_file: Option<File>,
-    // prev_pendings: Option<VecDeque<PendingWrite<Op>>>,
 }
 
 struct WriteSyncShared {
