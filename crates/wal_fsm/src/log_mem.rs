@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{LogCtx, LogDiscard, LogRead, LogWrite, LogWriteOptions, LSN};
+use crate::{LogCtx, LogDiscard, LogRead, LogWrite, LogWriteOptions, Lsn};
 use anyhow::Result;
 use once_cell::sync::OnceCell;
 use smart_default::SmartDefault;
@@ -30,13 +30,13 @@ impl<Op> MemLogStorage<Op> {
 
 #[derive(Clone)]
 struct MemLogRecord<Op> {
-    lsn: LSN,
+    lsn: Lsn,
     op: Op,
 }
 
 struct PendingLog<Op> {
     op: Op,
-    lsn: LSN,
+    lsn: Lsn,
     sync_time: Instant,
 }
 
@@ -48,7 +48,7 @@ struct StorageShared<Op> {
 #[derive(SmartDefault)]
 struct SyncShared<Op> {
     pendings: Mutex<VecDeque<PendingLog<Op>>>,
-    sink: OnceCell<Box<dyn Send + Sync + Fn(LSN)>>,
+    sink: OnceCell<Box<dyn Send + Sync + Fn(Lsn)>>,
     killed: AtomicBool,
     cond: Condvar,
 }
@@ -152,7 +152,7 @@ impl<Op> LogWrite<Op> for WriteImpl<Op>
 where
     Op: Send + Sync + Clone + 'static,
 {
-    fn init(&mut self, _start_lsn: LSN, sink: Box<dyn Send + Sync + Fn(LSN)>) -> Result<()> {
+    fn init(&mut self, _start_lsn: Lsn, sink: Box<dyn Send + Sync + Fn(Lsn)>) -> Result<()> {
         self.sync
             .sink
             .set(sink)
@@ -161,7 +161,7 @@ where
         Ok(())
     }
 
-    fn fire_write(&mut self, op: &Op, lsn: LSN, _options: &LogWriteOptions) -> Result<()> {
+    fn fire_write(&mut self, op: &Op, lsn: Lsn, _options: &LogWriteOptions) -> Result<()> {
         let mut pendings = self.sync.pendings.lock().unwrap();
         pendings.push_back(PendingLog {
             lsn,
@@ -177,7 +177,7 @@ impl<Op> LogRead<Op> for ReadDiscardImpl<Op>
 where
     Op: Send + Sync + Clone + 'static,
 {
-    fn read(&mut self, start: LSN) -> Result<Box<dyn Iterator<Item = (Op, LSN)>>> {
+    fn read(&mut self, start: Lsn) -> Result<Box<dyn Iterator<Item = (Op, Lsn)>>> {
         let records = self.stor.records.lock().unwrap();
         let res_vec = records
             .iter()
@@ -193,7 +193,7 @@ impl<Op> LogDiscard for ReadDiscardImpl<Op>
 where
     Op: Send + Sync + Clone + 'static,
 {
-    fn fire_discard(&mut self, lsn: LSN) -> Result<()> {
+    fn fire_discard(&mut self, lsn: Lsn) -> Result<()> {
         let mut records = self.stor.records.lock().unwrap();
         while let Some(rec) = records.front() {
             if rec.lsn <= lsn {
@@ -222,13 +222,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::{check_non_blocking, LogCtx, LogWriteOptions, MemLogStorage, LSN};
+    use crate::{
+        tests::{check_non_blocking, LogSyncWait},
+        LogCtx, LogWriteOptions, Lsn, MemLogStorage,
+    };
     use anyhow::Result;
     use std::{thread::sleep, time::Duration, vec};
 
     #[derive(Clone, Eq, PartialEq, Debug)]
     struct TestOp {
-        no: LSN, // equal to LSN
+        no: Lsn, // equal to LSN
     }
 
     #[test]
@@ -236,22 +239,8 @@ mod tests {
         let mut stor = MemLogStorage::new(Duration::from_millis(50));
 
         let mut ctx = LogCtx::<TestOp>::memory(&mut stor);
-        let (send, recv) = crossbeam::channel::bounded(0);
-
-        ctx.write.init(
-            1,
-            Box::new(move |lsn| {
-                send.send(lsn).unwrap();
-            }),
-        )?;
-
-        let mut cur_lsn = 0;
-        let cur_lsn_ref = &mut cur_lsn;
-        let mut expect_lsn_sync = move |lsn: LSN| {
-            while lsn > *cur_lsn_ref {
-                *cur_lsn_ref = recv.recv().unwrap();
-            }
-        };
+        let (mut sync_wait, sync_sink) = LogSyncWait::create();
+        ctx.write.init(1, sync_sink)?;
 
         check_non_blocking(|| {
             ctx.write
@@ -264,7 +253,7 @@ mod tests {
                 .unwrap()
         });
 
-        expect_lsn_sync(2);
+        sync_wait.wait(2);
 
         {
             let read_res = ctx.read.read(0).unwrap().collect::<Vec<_>>();
@@ -319,22 +308,8 @@ mod tests {
 
         {
             let mut ctx = LogCtx::<TestOp>::memory(&mut stor);
-            let (send, recv) = crossbeam::channel::bounded(0);
-
-            ctx.write.init(
-                4,
-                Box::new(move |lsn| {
-                    send.send(lsn).unwrap();
-                }),
-            )?;
-
-            let mut cur_lsn = 0;
-            let cur_lsn_ref = &mut cur_lsn;
-            let mut expect_lsn_sync = move |lsn: LSN| {
-                while lsn > *cur_lsn_ref {
-                    *cur_lsn_ref = recv.recv().unwrap();
-                }
-            };
+            let (mut sync_wait, sync_sink) = LogSyncWait::create();
+            ctx.write.init(1, sync_sink)?;
 
             check_non_blocking(|| {
                 ctx.write
@@ -347,7 +322,7 @@ mod tests {
                     .unwrap()
             });
 
-            expect_lsn_sync(5);
+            sync_wait.wait(5);
 
             check_non_blocking(|| drop(ctx));
         }

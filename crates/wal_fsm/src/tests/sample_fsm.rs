@@ -21,22 +21,22 @@ pub enum SampleOp {
 }
 
 pub struct SampleStorage {
-    data: Mutex<(LSN, i32)>,
+    data: Mutex<(Lsn, i32)>,
 }
 
 impl SampleStorage {
-    fn new(lsn: LSN, num: i32) -> Self {
+    fn new(lsn: Lsn, num: i32) -> Self {
         SampleStorage {
             data: (lsn, num).into(),
         }
     }
 
-    fn load(&self) -> (LSN, i32) {
+    fn load(&self) -> (Lsn, i32) {
         sleep(STORAGE_DELAY);
         *self.data.lock().unwrap()
     }
 
-    fn save(&self, lsn: LSN, num: i32) {
+    fn save(&self, lsn: Lsn, num: i32) {
         sleep(STORAGE_DELAY);
         let mut lck = self.data.lock().unwrap();
         let (prev_lsn, _) = *lck;
@@ -48,7 +48,7 @@ impl SampleStorage {
 #[derive(Debug)]
 struct SampleStateMachineState {
     num: i32,
-    lsn: LSN,
+    lsn: Lsn,
     persister_thread: Option<JoinHandle<()>>,
     persister_do_send: Sender<()>,
     persister_kill_send: Sender<()>,
@@ -139,7 +139,7 @@ impl Drop for SampleStateMachine {
     }
 }
 
-impl StateMachine for SampleStateMachine {
+impl Fsm for SampleStateMachine {
     type Op = SampleOp;
 
     fn init(&self, sink: Box<dyn ReportSink>) -> Init {
@@ -176,7 +176,7 @@ impl StateMachine for SampleStateMachine {
         Init { next_lsn: lsn + 1 }
     }
 
-    fn apply(&self, op: SampleOp, lsn: LSN) {
+    fn apply(&self, op: SampleOp, lsn: Lsn) {
         let mut state = self.0.get_state();
 
         assert_eq!(state.lsn + 1, lsn);
@@ -193,7 +193,7 @@ impl StateMachine for SampleStateMachine {
 mock! {
     pub SampleReportSink {}
     impl ReportSink for SampleReportSink {
-        fn report_snapshot_lsn(&self, _lsn: LSN);
+        fn report_snapshot_lsn(&self, _lsn: Lsn);
     }
 }
 
@@ -295,7 +295,7 @@ fn logged_sample_sm_normal() -> Result<()> {
 
     let sm = SampleStateMachine::new(storage.clone());
     let mut mem_log = MemLogStorage::new(Duration::from_secs(0));
-    let logged = Logged::new(sm, LogCtx::memory(&mut mem_log))?;
+    let logged = WalFsm::new(sm, LogCtx::memory(&mut mem_log))?;
 
     logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: true });
     assert_eq!(logged.get_num(), 2);
@@ -332,7 +332,7 @@ fn logged_sample_sm_sync_durable() -> Result<()> {
 
     {
         let sm = SampleStateMachine::new(storage.clone());
-        let logged = Logged::new(sm, LogCtx::memory(&mut mem_log))?;
+        let logged = WalFsm::new(sm, LogCtx::memory(&mut mem_log))?;
 
         check_blocking(
             || logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: true }),
@@ -351,7 +351,7 @@ fn logged_sample_sm_sync_durable() -> Result<()> {
 
     {
         let sm = SampleStateMachine::new(storage.clone());
-        let logged = Logged::new(sm, LogCtx::memory(&mut mem_log))?;
+        let logged = WalFsm::new(sm, LogCtx::memory(&mut mem_log))?;
 
         // check not persisted by sm itself
         let (_, num) = storage.load();
@@ -371,7 +371,7 @@ fn logged_sample_sm_async_lost() -> Result<()> {
 
     {
         let sm = SampleStateMachine::new(storage.clone());
-        let logged = Logged::new(sm, LogCtx::memory(&mut mem_log))?;
+        let logged = WalFsm::new(sm, LogCtx::memory(&mut mem_log))?;
 
         check_non_blocking(|| logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: false }));
         assert_eq!(logged.get_num(), 2);
@@ -386,7 +386,7 @@ fn logged_sample_sm_async_lost() -> Result<()> {
 
     {
         let sm = SampleStateMachine::new(storage.clone());
-        let logged = Logged::new(sm, LogCtx::memory(&mut mem_log))?;
+        let logged = WalFsm::new(sm, LogCtx::memory(&mut mem_log))?;
 
         // check not persisted by sm itself
         let (_, num) = storage.load();

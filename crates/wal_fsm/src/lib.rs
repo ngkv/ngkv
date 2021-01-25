@@ -23,38 +23,38 @@ use std::{
 
 // Log Sequence Number
 // NOTE: LSN 1 represents the first log
-pub type LSN = u64;
+pub type Lsn = u64;
 
 pub trait ReportSink: Send + Sync {
-    fn report_snapshot_lsn(&self, lsn: LSN);
+    fn report_snapshot_lsn(&self, lsn: Lsn);
 }
 
 struct PendingApply {
-    lsn: LSN,
+    lsn: Lsn,
     done: AtomicBool,
     cond: Condvar,
 }
 
 struct LoggedState<Op> {
-    next_lsn: LSN,
+    next_lsn: Lsn,
     log_write: Box<dyn LogWrite<Op>>,
     log_discard: Box<dyn LogDiscard>,
     pending_applies: VecDeque<Arc<PendingApply>>,
 }
 
-struct LoggedInner<S: StateMachine> {
+struct LoggedInner<S: Fsm> {
     state: Mutex<LoggedState<S::Op>>,
     sm: S,
 }
 
-pub struct Logged<S: StateMachine>(Arc<LoggedInner<S>>);
+pub struct WalFsm<S: Fsm>(Arc<LoggedInner<S>>);
 
-struct ReportSinkImpl<S: StateMachine> {
+struct ReportSinkImpl<S: Fsm> {
     logged: Weak<LoggedInner<S>>,
 }
 
-impl<S: StateMachine> ReportSink for ReportSinkImpl<S> {
-    fn report_snapshot_lsn(&self, lsn: LSN) {
+impl<S: Fsm> ReportSink for ReportSinkImpl<S> {
+    fn report_snapshot_lsn(&self, lsn: Lsn) {
         // update (highest included) snapshot lsn
         // which could be safely discarded
         let this = Weak::upgrade(&self.logged).expect("already destroyed");
@@ -69,7 +69,7 @@ pub struct ApplyOptions {
     pub is_sync: bool,
 }
 
-impl<S: StateMachine> Deref for Logged<S> {
+impl<S: Fsm> Deref for WalFsm<S> {
     type Target = S;
 
     fn deref(&self) -> &Self::Target {
@@ -77,8 +77,8 @@ impl<S: StateMachine> Deref for Logged<S> {
     }
 }
 
-impl<S: StateMachine> LoggedInner<S> {
-    fn finalize_pending(&self, lsn: LSN) {
+impl<S: Fsm> LoggedInner<S> {
+    fn finalize_pending(&self, lsn: Lsn) {
         let mut state = self.state.lock().unwrap();
         while let Some(p) = state.pending_applies.front() {
             if p.lsn > lsn {
@@ -92,7 +92,7 @@ impl<S: StateMachine> LoggedInner<S> {
     }
 }
 
-impl<S: StateMachine> Logged<S> {
+impl<S: Fsm> WalFsm<S> {
     pub fn new(sm: S, log_ctx: LogCtx<S::Op>) -> Result<Self> {
         let this = Arc::new(LoggedInner {
             sm,
@@ -138,7 +138,7 @@ impl<S: StateMachine> Logged<S> {
             )?;
         }
 
-        Ok(Logged(this))
+        Ok(WalFsm(this))
     }
 
     pub fn apply(&self, op: S::Op, options: ApplyOptions) {
@@ -182,38 +182,3 @@ impl<S: StateMachine> Logged<S> {
         self.0.sm.apply(op, lsn)
     }
 }
-
-#[cfg(test)]
-mod block_ck {
-    use std::time::{Duration, Instant};
-
-    const ENABLE_CHECK_NON_BLOCKING: bool = false;
-    const NON_BLOCKING_THRESHOLD: Duration = Duration::from_millis(10);
-
-    pub fn check_non_blocking(f: impl FnOnce()) {
-        let now = Instant::now();
-        f();
-        let time = Instant::now() - now;
-        if ENABLE_CHECK_NON_BLOCKING {
-            assert!(
-                time < NON_BLOCKING_THRESHOLD,
-                "check_non_blocking failed ({}ms)",
-                time.as_millis()
-            );
-        }
-    }
-
-    pub fn check_blocking(f: impl FnOnce(), dur: Duration) {
-        let now = Instant::now();
-        f();
-        let time = Instant::now() - now;
-        assert!(
-            time >= dur,
-            "check_blocking failed ({}ms)",
-            time.as_millis()
-        );
-    }
-}
-
-#[cfg(test)]
-use block_ck::*;

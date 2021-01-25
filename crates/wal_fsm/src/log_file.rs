@@ -21,7 +21,7 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     crc32_io::{Crc32Read, Crc32Write},
-    LogCtx, LogDiscard, LogRead, LogWrite, LogWriteOptions, LSN,
+    LogCtx, LogDiscard, LogRead, LogWrite, LogWriteOptions, Lsn,
 };
 
 #[derive(Clone)]
@@ -173,7 +173,7 @@ fn write_record(
 // log-{start}
 
 // Return start LSN
-fn parse_file_name(name: &str) -> Result<LSN> {
+fn parse_file_name(name: &str) -> Result<Lsn> {
     let fields = name.split("-").collect::<Vec<_>>();
     ensure!(
         fields.len() == 2 && fields[0] == "log",
@@ -183,13 +183,13 @@ fn parse_file_name(name: &str) -> Result<LSN> {
     Ok(fields[1].parse()?)
 }
 
-fn make_file_name(start_lsn: LSN) -> String {
+fn make_file_name(start_lsn: Lsn) -> String {
     format!("log-{}", start_lsn)
 }
 
 struct ReadLogIter<R, Op> {
     reader: R,
-    next_lsn: LSN,
+    next_lsn: Lsn,
     _op: PhantomData<Op>,
 }
 
@@ -198,7 +198,7 @@ where
     R: Read,
     Op: DeserializeOwned,
 {
-    type Item = (Op, LSN);
+    type Item = (Op, Lsn);
 
     fn next(&mut self) -> Option<Self::Item> {
         let op = read_record(&mut self.reader)?;
@@ -209,13 +209,13 @@ where
 }
 
 struct FileInfo {
-    start_lsn: LSN,
+    start_lsn: Lsn,
     file: File,
     path: PathBuf,
 }
 
 impl FileInfo {
-    fn iter_logs<Op>(self) -> impl Iterator<Item = (Op, LSN)>
+    fn iter_logs<Op>(self) -> impl Iterator<Item = (Op, Lsn)>
     where
         Op: DeserializeOwned,
     {
@@ -237,7 +237,7 @@ impl<Op> LogRead<Op> for ReadImpl<Op>
 where
     Op: Send + Sync + DeserializeOwned + 'static,
 {
-    fn read(&mut self, start: LSN) -> Result<Box<dyn Iterator<Item = (Op, LSN)>>> {
+    fn read(&mut self, start: Lsn) -> Result<Box<dyn Iterator<Item = (Op, Lsn)>>> {
         let files = read_dir_logs(&self.dir)?;
 
         let (higher, lower): (Vec<_>, Vec<_>) =
@@ -266,8 +266,8 @@ struct SingleLogFile {
     fd: File,
     size: u64,
     request_force_sync: bool,
-    sync_lsn: LSN,
-    pending_lsn: LSN,
+    sync_lsn: Lsn,
+    pending_lsn: Lsn,
 }
 
 struct WriteSyncState {
@@ -280,7 +280,7 @@ struct WriteSyncShared {
     cond: Condvar,
     killed: AtomicBool,
     failed: AtomicBool,
-    sink: Box<dyn Send + Sync + Fn(LSN)>,
+    sink: Box<dyn Send + Sync + Fn(Lsn)>,
     state: Mutex<WriteSyncState>,
 }
 
@@ -294,9 +294,17 @@ impl<Op> WriteInner<Op>
 where
     Op: Send + Sync + Clone + Serialize + 'static,
 {
-    fn open_log_file(start_lsn: LSN, options: &FileLogOptions) -> Result<SingleLogFile> {
-        let path = make_file_name(start_lsn);
-        let file = OpenOptions::new().write(true).truncate(true).open(path)?;
+    fn open_log_file(start_lsn: Lsn, options: &FileLogOptions) -> Result<SingleLogFile> {
+        let name = make_file_name(start_lsn);
+
+        let mut path = options.dir.clone();
+        path.push(name);
+
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
         file.set_len(options.log_step_size)?;
 
         Ok(SingleLogFile {
@@ -423,8 +431,8 @@ where
     }
 
     fn new(
-        start_lsn: LSN,
-        sink: Box<dyn Send + Sync + Fn(LSN)>,
+        start_lsn: Lsn,
+        sink: Box<dyn Send + Sync + Fn(Lsn)>,
         options: FileLogOptions,
     ) -> Result<Self> {
         let cur_file = Self::open_log_file(start_lsn, &options)?;
@@ -450,7 +458,7 @@ where
         })
     }
 
-    fn fire_write(&mut self, op: &Op, lsn: LSN, options: &LogWriteOptions) -> Result<()> {
+    fn fire_write(&mut self, op: &Op, lsn: Lsn, options: &LogWriteOptions) -> Result<()> {
         // Serialize ahead of time to avoid duplicated serialization.
         let op_buf = serialize_op(op)?;
 
@@ -474,6 +482,7 @@ where
                     state.cur_file.written += written;
                     state.cur_file.pending_lsn = lsn;
                     state.cur_file.request_force_sync |= options.force_sync;
+                    self.sync_shared.cond.notify_one();
                     break;
                 }
                 WriteRecordStatus::NoEnoughSpace(space) => {
@@ -506,7 +515,7 @@ impl<Op> LogWrite<Op> for WriteImpl<Op>
 where
     Op: Send + Sync + Clone + Serialize + 'static,
 {
-    fn init(&mut self, start_lsn: LSN, sink: Box<dyn Send + Sync + Fn(LSN)>) -> Result<()> {
+    fn init(&mut self, start_lsn: Lsn, sink: Box<dyn Send + Sync + Fn(Lsn)>) -> Result<()> {
         self.inner
             .set(WriteInner::new(
                 start_lsn,
@@ -518,7 +527,7 @@ where
         Ok(())
     }
 
-    fn fire_write(&mut self, op: &Op, lsn: LSN, options: &LogWriteOptions) -> Result<()> {
+    fn fire_write(&mut self, op: &Op, lsn: Lsn, options: &LogWriteOptions) -> Result<()> {
         self.inner
             .get_mut()
             .expect("not init")
@@ -531,7 +540,7 @@ struct DiscardImpl {
 }
 
 impl LogDiscard for DiscardImpl {
-    fn fire_discard(&mut self, lsn: LSN) -> Result<()> {
+    fn fire_discard(&mut self, lsn: Lsn) -> Result<()> {
         // Find all files whose start_lsn <= lsn
         let files = read_dir_logs(&self.dir)?;
         let mut lower = files
@@ -570,5 +579,93 @@ where
                 dir: options.dir.clone(),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{tests::LogSyncWait, FileLogOptions, FileSyncPolicy, LogCtx, LogWriteOptions, Lsn};
+    use anyhow::Result;
+    use crossbeam::channel::unbounded;
+    use itertools::Itertools;
+    use serde::{Deserialize, Serialize};
+    use std::{
+        path::{Path, PathBuf},
+        time::Duration,
+    };
+    use tempdir::TempDir;
+
+    // A log entry of TestOp is 18 bytes
+    #[derive(Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
+    struct TestOp {
+        no: Lsn, // equal to LSN
+    }
+
+    fn temp_dir() -> Result<TempDir> {
+        let dir = TempDir::new("wal_fsm")?;
+        Ok(dir)
+    }
+
+    fn test_option_small(dir: &Path) -> FileLogOptions {
+        FileLogOptions {
+            dir: PathBuf::from(dir),
+            log_step_size: 64,
+            log_switch_size: 128,
+            sync_policy: FileSyncPolicy::Periodical(Duration::from_secs(1)),
+        }
+    }
+
+    #[test]
+    fn file_log_write_close_read() {
+        let dir = temp_dir().unwrap();
+        let options = test_option_small(dir.path());
+
+        {
+            let mut ctx = LogCtx::<TestOp>::file(&options);
+            let (mut sync_wait, sync_sink) = LogSyncWait::create();
+            ctx.write.init(1, sync_sink).unwrap();
+
+            ctx.write
+                .fire_write(&TestOp { no: 1 }, 1, &LogWriteOptions { force_sync: false })
+                .unwrap();
+            ctx.write
+                .fire_write(&TestOp { no: 2 }, 2, &LogWriteOptions { force_sync: false })
+                .unwrap();
+            ctx.write
+                .fire_write(&TestOp { no: 3 }, 3, &LogWriteOptions { force_sync: true })
+                .unwrap();
+
+            sync_wait.wait(3);
+        }
+
+        {
+            let mut ctx = LogCtx::<TestOp>::file(&options);
+            let read_op_lsn = ctx.read.read(0).unwrap().collect_vec();
+            assert_eq!(read_op_lsn.len(), 3);
+            for (i, (op, lsn)) in read_op_lsn.iter().enumerate() {
+                assert_eq!(i as u64 + 1, op.no);
+                assert_eq!(op.no, *lsn);
+            }
+        }
+    }
+
+    // #[test]
+    fn file_log_no_force_sync() -> Result<()> {
+        todo!()
+    }
+
+    // #[test]
+    fn file_log_discard() -> Result<()> {
+        todo!()
+    }
+
+    // #[test]
+    fn file_log_corrupt_check() -> Result<()> {
+        todo!()
+    }
+
+    // #[test]
+    fn file_log_stress() -> Result<()> {
+        todo!()
     }
 }
