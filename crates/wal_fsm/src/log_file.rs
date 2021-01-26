@@ -799,7 +799,7 @@ mod tests {
             let name = make_file_name(1);
             let file_path = dir.path().join(name);
             let mut data = std::fs::read(&file_path).unwrap();
-            data[5] = data[5] ^ 0x80;
+            data[7] = data[7] ^ 0x80;
             std::fs::write(&file_path, &data).unwrap();
         }
 
