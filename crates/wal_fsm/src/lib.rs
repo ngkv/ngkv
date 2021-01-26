@@ -61,7 +61,10 @@ impl<S: Fsm> ReportSink for ReportSinkImpl<S> {
         let mut state = this.state.lock().unwrap();
 
         // TODO handle discard error
-        state.log_discard.fire_discard(lsn).expect("error handling not supported");
+        state
+            .log_discard
+            .fire_discard(lsn)
+            .expect("error handling not supported");
     }
 }
 
@@ -121,9 +124,9 @@ impl<S: Fsm> WalFsm<S> {
 
             // replay log
             let mut log_read = log_ctx.read;
-            for (op, lsn) in log_read.read(next_lsn)? {
-                assert_eq!(lsn, state.next_lsn);
-                this.sm.apply(op, state.next_lsn);
+            for rec in log_read.read(next_lsn)? {
+                assert_eq!(rec.lsn, state.next_lsn);
+                this.sm.apply(rec.op, state.next_lsn);
                 state.next_lsn += 1;
             }
 
@@ -159,12 +162,13 @@ impl<S: Fsm> WalFsm<S> {
             state.pending_applies.push_back(pending);
         }
 
+        let rec = LogRecord { op, lsn };
+
         // TODO handle log write error
         state
             .log_write
             .fire_write(
-                &op,
-                lsn,
+                &rec,
                 &LogWriteOptions {
                     force_sync: options.is_sync,
                 },
@@ -179,6 +183,6 @@ impl<S: Fsm> WalFsm<S> {
             }
         }
 
-        self.0.sm.apply(op, lsn)
+        self.0.sm.apply(rec.op, lsn)
     }
 }

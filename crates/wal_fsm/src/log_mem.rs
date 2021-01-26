@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{LogCtx, LogDiscard, LogRead, LogWrite, LogWriteOptions, Lsn};
+use crate::{LogCtx, LogDiscard, LogRead, LogRecord, LogWrite, LogWriteOptions, Lsn};
 use anyhow::Result;
 use once_cell::sync::OnceCell;
 use smart_default::SmartDefault;
@@ -161,11 +161,11 @@ where
         Ok(())
     }
 
-    fn fire_write(&mut self, op: &Op, lsn: Lsn, _options: &LogWriteOptions) -> Result<()> {
+    fn fire_write(&mut self, rec: &LogRecord<Op>, _options: &LogWriteOptions) -> Result<()> {
         let mut pendings = self.sync.pendings.lock().unwrap();
         pendings.push_back(PendingLog {
-            lsn,
-            op: op.clone(),
+            lsn: rec.lsn,
+            op: rec.op.clone(),
             sync_time: Instant::now() + self.stor.sync_delay,
         });
         self.sync.cond.notify_one();
@@ -177,12 +177,15 @@ impl<Op> LogRead<Op> for ReadDiscardImpl<Op>
 where
     Op: Send + Sync + Clone + 'static,
 {
-    fn read(&mut self, start: Lsn) -> Result<Box<dyn Iterator<Item = (Op, Lsn)>>> {
+    fn read(&mut self, start: Lsn) -> Result<Box<dyn Iterator<Item = LogRecord<Op>>>> {
         let records = self.stor.records.lock().unwrap();
         let res_vec = records
             .iter()
             .filter(|rec| rec.lsn >= start)
-            .map(|rec| (rec.op.clone(), rec.lsn))
+            .map(|rec| LogRecord {
+                op: rec.op.clone(),
+                lsn: rec.lsn,
+            })
             .collect::<Vec<_>>();
 
         Ok(Box::new(res_vec.into_iter()))
@@ -223,16 +226,11 @@ where
 #[cfg(test)]
 mod tests {
     use crate::{
-        tests::{check_non_blocking, LogSyncWait},
-        LogCtx, LogWriteOptions, Lsn, MemLogStorage,
+        tests::{assert_test_op_iter, check_non_blocking, test_op_write, LogSyncWait, TestOp},
+        LogCtx, LogWriteOptions, MemLogStorage,
     };
     use anyhow::Result;
     use std::{thread::sleep, time::Duration, vec};
-
-    #[derive(Clone, Eq, PartialEq, Debug)]
-    struct TestOp {
-        no: Lsn, // equal to LSN
-    }
 
     #[test]
     fn mem_log_normal() -> Result<()> {
@@ -242,34 +240,32 @@ mod tests {
         let (mut sync_wait, sync_sink) = LogSyncWait::create();
         ctx.write.init(1, sync_sink)?;
 
-        check_non_blocking(|| {
-            ctx.write
-                .fire_write(&TestOp { no: 1 }, 1, &LogWriteOptions::default())
-                .unwrap()
-        });
-        check_non_blocking(|| {
-            ctx.write
-                .fire_write(&TestOp { no: 2 }, 2, &LogWriteOptions::default())
-                .unwrap()
-        });
+        test_op_write(&mut *ctx.write, 1, &LogWriteOptions::default());
+        test_op_write(&mut *ctx.write, 2, &LogWriteOptions::default());
 
         sync_wait.wait(2);
 
         {
             let read_res = ctx.read.read(0).unwrap().collect::<Vec<_>>();
-            assert_eq!(read_res, vec![(TestOp { no: 1 }, 1), (TestOp { no: 2 }, 2)]);
+            assert_eq!(read_res.len(), 2);
+            assert_eq!(read_res[0].lsn, 1);
+            assert_test_op_iter(read_res.iter());
         }
 
         {
             let read_res = ctx.read.read(2).unwrap().collect::<Vec<_>>();
-            assert_eq!(read_res, vec![(TestOp { no: 2 }, 2)]);
+            assert_eq!(read_res.len(), 1);
+            assert_eq!(read_res[0].lsn, 2);
+            assert_test_op_iter(read_res.iter());
         }
 
         check_non_blocking(|| ctx.discard.fire_discard(1).unwrap());
 
         {
             let read_res = ctx.read.read(0).unwrap().collect::<Vec<_>>();
-            assert_eq!(read_res, vec![(TestOp { no: 2 }, 2)]);
+            assert_eq!(read_res.len(), 1);
+            assert_eq!(read_res[0].lsn, 2);
+            assert_test_op_iter(read_res.iter());
         }
 
         Ok(())
@@ -282,12 +278,8 @@ mod tests {
         {
             let mut ctx = LogCtx::<TestOp>::memory(&mut stor);
             ctx.write.init(1, Box::new(|_| {}))?;
-            ctx.write
-                .fire_write(&TestOp { no: 1 }, 1, &LogWriteOptions::default())
-                .unwrap();
-            ctx.write
-                .fire_write(&TestOp { no: 2 }, 2, &LogWriteOptions::default())
-                .unwrap();
+            test_op_write(&mut *ctx.write, 1, &LogWriteOptions::default());
+            test_op_write(&mut *ctx.write, 2, &LogWriteOptions::default());
         }
 
         // wait at least sync_delay
@@ -310,17 +302,8 @@ mod tests {
             let mut ctx = LogCtx::<TestOp>::memory(&mut stor);
             let (mut sync_wait, sync_sink) = LogSyncWait::create();
             ctx.write.init(1, sync_sink)?;
-
-            check_non_blocking(|| {
-                ctx.write
-                    .fire_write(&TestOp { no: 4 }, 4, &LogWriteOptions::default())
-                    .unwrap()
-            });
-            check_non_blocking(|| {
-                ctx.write
-                    .fire_write(&TestOp { no: 5 }, 5, &LogWriteOptions::default())
-                    .unwrap()
-            });
+            test_op_write(&mut *ctx.write, 4, &LogWriteOptions::default());
+            test_op_write(&mut *ctx.write, 5, &LogWriteOptions::default());
 
             sync_wait.wait(5);
 
@@ -330,7 +313,9 @@ mod tests {
         {
             let mut ctx = LogCtx::<TestOp>::memory(&mut stor);
             let read_res = ctx.read.read(4)?.collect::<Vec<_>>();
-            assert_eq!(read_res, vec![(TestOp { no: 4 }, 4), (TestOp { no: 5 }, 5)]);
+            assert_eq!(read_res.len(), 2);
+            assert_eq!(read_res[0].lsn, 4);
+            assert_test_op_iter(read_res.iter());
         }
 
         Ok(())

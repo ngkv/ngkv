@@ -16,8 +16,11 @@ smart-default = "0.6.0"
 itertools = "0.10.0"
 byteorder = "1.4.2"
 crc32fast = "1.2.1"
-thiserror = "1.0.23"
+log = "0.4.13"
+env_logger = "0.8.2"
+chrono = "0.4.19"
 
 [dev-dependencies]
 mockall = "0.9.0"
 tempdir = "0.3.7"
+ctor = "0.1.18"

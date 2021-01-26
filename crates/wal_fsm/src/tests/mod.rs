@@ -1,13 +1,36 @@
 mod sample_fsm;
 
 pub use super::*;
-use crossbeam::channel::Receiver;
 pub use sample_fsm::*;
 
-use std::time::{Duration, Instant};
+use crossbeam::channel::Receiver;
+use serde::{Deserialize, Serialize};
+
+use std::{
+    io::Write,
+    time::{Duration, Instant},
+};
 
 const ENABLE_CHECK_NON_BLOCKING: bool = false;
-const NON_BLOCKING_THRESHOLD: Duration = Duration::from_millis(10);
+const NON_BLOCKING_THRESHOLD: Duration = Duration::from_millis(1);
+
+#[ctor::ctor]
+fn init_logger() {
+    let _ = env_logger::builder()
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "{}:{} {} [{}] - {}",
+                record.file().unwrap_or("unknown"),
+                record.line().unwrap_or(0),
+                chrono::Local::now().format("%Y-%m-%dT%H:%M:%S"),
+                record.level(),
+                record.args()
+            )
+        })
+        .is_test(true)
+        .try_init();
+}
 
 pub fn check_non_blocking(f: impl FnOnce()) {
     let now = Instant::now();
@@ -40,7 +63,7 @@ pub struct LogSyncWait {
 
 impl LogSyncWait {
     pub fn create() -> (Self, Box<dyn Send + Sync + 'static + Fn(Lsn)>) {
-        let (send, recv) = crossbeam::channel::bounded(0);
+        let (send, recv) = crossbeam::channel::unbounded();
 
         let sink = Box::new(move |lsn| {
             send.send(lsn).unwrap();
@@ -54,4 +77,36 @@ impl LogSyncWait {
             self.cur_lsn = self.recv.recv().unwrap();
         }
     }
+}
+
+// A log entry of TestOp is 18 bytes
+#[derive(Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
+pub struct TestOp {
+    pub no: Lsn, // equal to Lsn
+}
+
+// Basic sanity checks for read result.
+pub fn assert_test_op_iter<'a>(iter: impl Iterator<Item = &'a LogRecord<TestOp>>) {
+    let mut prev_lsn = None;
+    for rec in iter {
+        // Check TestOp::no == Lsn.
+        assert_eq!(rec.op.no, rec.lsn);
+
+        // Check Lsn consecutive.
+        if let Some(prev) = prev_lsn {
+            assert_eq!(prev + 1, rec.lsn);
+        }
+        prev_lsn = Some(rec.lsn);
+    }
+}
+
+pub fn test_op_write(w: &mut dyn LogWrite<TestOp>, lsn: Lsn, options: &LogWriteOptions) {
+    w.fire_write(
+        &LogRecord {
+            op: TestOp { no: lsn },
+            lsn,
+        },
+        options,
+    )
+    .unwrap()
 }
