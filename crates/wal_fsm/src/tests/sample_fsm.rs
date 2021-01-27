@@ -3,7 +3,6 @@ use super::*;
 use crossbeam::channel::{Receiver, Sender};
 use mockall::*;
 use once_cell::sync::OnceCell;
-use serde::{Deserialize, Serialize};
 
 use std::{
     sync::Arc,
@@ -15,7 +14,7 @@ use std::{
 const STORAGE_DELAY: Duration = Duration::from_millis(20);
 const PERSISTER_TEST_WAIT: Duration = Duration::from_millis(50);
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Clone)]
 pub enum SampleOp {
     AddOne, // add one, return result
 }

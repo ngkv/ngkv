@@ -8,8 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{LogCtx, LogDiscard, LogRead, LogRecord, LogWrite, LogWriteOptions, Lsn};
-use anyhow::Result;
+use crate::{LogCtx, LogDiscard, LogRead, LogRecord, LogWrite, LogWriteOptions, Lsn, Result};
 use once_cell::sync::OnceCell;
 use smart_default::SmartDefault;
 
@@ -227,9 +226,8 @@ where
 mod tests {
     use crate::{
         tests::{assert_test_op_iter, check_non_blocking, test_op_write, LogSyncWait, TestOp},
-        LogCtx, LogWriteOptions, MemLogStorage,
+        LogCtx, LogWriteOptions, MemLogStorage, Result,
     };
-    use anyhow::Result;
     use std::{thread::sleep, time::Duration, vec};
 
     #[test]

@@ -6,7 +6,7 @@ mod state_machine;
 #[cfg(test)]
 mod tests;
 
-use anyhow::Result;
+use thiserror::Error;
 
 // crate
 pub use crate::{log_ctx::*, log_file::*, log_mem::*, state_machine::*};
@@ -14,12 +14,34 @@ pub use crate::{log_ctx::*, log_file::*, log_mem::*, state_machine::*};
 // std
 use std::{
     collections::VecDeque,
+    io,
     ops::Deref,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Condvar, Mutex, Weak,
     },
 };
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error("reportable bug: {0}")]
+    ReportableBug(String),
+}
+
+impl From<&str> for Error {
+    fn from(s: &str) -> Self {
+        Self::ReportableBug(s.to_string())
+    }
+}
+
+pub trait FsmOp: Send + Sync + Sized + 'static {
+    fn serialize(&self) -> Vec<u8>;
+    fn deserialize(buf: &[u8]) -> Result<Self>;
+}
 
 // Log Sequence Number
 // NOTE: LSN 1 represents the first log

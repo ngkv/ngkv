@@ -10,15 +10,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use itertools::Itertools;
 use once_cell::sync::OnceCell;
-use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     crc32_io::{Crc32Read, Crc32Write},
-    LogCtx, LogDiscard, LogRead, LogRecord, LogWrite, LogWriteOptions, Lsn,
+    Error, FsmOp, LogCtx, LogDiscard, LogRead, LogRecord, LogWrite, LogWriteOptions, Lsn, Result,
 };
 
 #[derive(Clone)]
@@ -50,12 +48,15 @@ enum LogEntryType {
 }
 
 impl TryFrom<u8> for LogEntryType {
-    type Error = anyhow::Error;
+    type Error = Error;
 
-    fn try_from(v: u8) -> anyhow::Result<Self> {
+    fn try_from(v: u8) -> Result<Self> {
         match v {
             x if x == LogEntryType::Default as u8 => Ok(LogEntryType::Default),
-            x => Err(anyhow!("invalid log entry type {}", x)),
+            x => Err(Error::ReportableBug(format!(
+                "invalid log entry type {}",
+                x
+            ))),
         }
     }
 }
@@ -67,7 +68,7 @@ fn read_dir_logs(dir: &Path) -> Result<Vec<FileInfo>> {
     for ent in read_dir(dir)? {
         let ent = ent?;
         let os_name = ent.file_name();
-        let name = os_name.to_str().ok_or(anyhow!("invalid log filename"))?;
+        let name = os_name.to_str().ok_or("invalid log filename")?;
         let start_lsn = parse_file_name(name)?;
         files.push(FileInfo {
             start_lsn,
@@ -86,7 +87,7 @@ fn read_dir_logs(dir: &Path) -> Result<Vec<FileInfo>> {
 //
 // Note that it never fails, corrupted entry & all entries after it are
 // discarded.
-fn read_record<Op: DeserializeOwned>(mut reader: impl Read) -> Option<Op> {
+fn read_record<Op: FsmOp>(mut reader: impl Read) -> Option<Op> {
     let result = || -> Result<Option<Op>> {
         // Following reads (until CRC itself) would be covered by CRC.
         let mut reader_crc = Crc32Read::new(&mut reader);
@@ -95,7 +96,9 @@ fn read_record<Op: DeserializeOwned>(mut reader: impl Read) -> Option<Op> {
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             x => x?,
         };
-        ensure!(magic == MAGIC, "magic mismatch");
+        if magic != MAGIC {
+            return Err("magic mismatch".into());
+        }
 
         // Read type.
         let typ = LogEntryType::try_from(reader_crc.read_u8()?)?;
@@ -108,10 +111,12 @@ fn read_record<Op: DeserializeOwned>(mut reader: impl Read) -> Option<Op> {
         // Compare CRC.
         let crc_actual = reader_crc.finalize();
         let crc_expect = reader.read_u32::<LittleEndian>()?;
-        ensure!(crc_actual == crc_expect, "crc mismatch");
+        if crc_actual != crc_expect {
+            return Err("crc mismatch".into());
+        }
 
         let op: Op = match typ {
-            LogEntryType::Default => bincode::deserialize(&payload_buf)?,
+            LogEntryType::Default => Op::deserialize(&payload_buf)?,
         };
 
         Ok(Some(op))
@@ -127,9 +132,8 @@ fn read_record<Op: DeserializeOwned>(mut reader: impl Read) -> Option<Op> {
 }
 
 // Serialize an op. Works together with write_record.
-fn serialize_op<Op: Serialize>(op: &Op) -> Result<Vec<u8>> {
-    let buf = bincode::serialize(op)?;
-    Ok(buf)
+fn serialize_op<Op: FsmOp>(op: &Op) -> Result<Vec<u8>> {
+    Ok(op.serialize())
 }
 
 fn record_size(payload_size: u64) -> u64 {
@@ -148,7 +152,7 @@ fn write_record(mut writer: impl Write, payload_buf: &[u8]) -> Result<()> {
     writer_crc.write_u8(LogEntryType::Default as u8)?;
 
     // Write payload.
-    let payload_len = u32::try_from(payload_buf.len()).with_context(|| "payload too long")?;
+    let payload_len = u32::try_from(payload_buf.len()).map_err(|_| "payload too long")?;
     writer_crc.write_u32::<LittleEndian>(payload_len)?;
     writer_crc.write_all(&payload_buf)?;
 
@@ -165,12 +169,11 @@ fn write_record(mut writer: impl Write, payload_buf: &[u8]) -> Result<()> {
 // Return start LSN
 fn parse_file_name(name: &str) -> Result<Lsn> {
     let fields = name.split("-").collect::<Vec<_>>();
-    ensure!(
-        fields.len() == 2 && fields[0] == "log",
-        "invalid log filename"
-    );
+    if !(fields.len() == 2 && fields[0] == "log") {
+        return Err("invalid log filename".into());
+    }
 
-    Ok(fields[1].parse()?)
+    Ok(fields[1].parse().map_err(|_| "invalid log filename")?)
 }
 
 fn make_file_name(start_lsn: Lsn) -> String {
@@ -186,7 +189,7 @@ struct ReadLogIter<R, Op> {
 impl<R, Op> Iterator for ReadLogIter<R, Op>
 where
     R: Read,
-    Op: DeserializeOwned,
+    Op: FsmOp,
 {
     type Item = LogRecord<Op>;
 
@@ -208,7 +211,7 @@ struct FileInfo {
 impl FileInfo {
     fn iter_logs<Op>(self) -> impl Iterator<Item = LogRecord<Op>>
     where
-        Op: DeserializeOwned,
+        Op: FsmOp,
     {
         log::info!("iterating file {}", self.start_lsn);
         let reader = BufReader::new(self.file);
@@ -227,7 +230,7 @@ struct ReadImpl<Op> {
 
 impl<Op> LogRead<Op> for ReadImpl<Op>
 where
-    Op: Send + Sync + DeserializeOwned + 'static,
+    Op: FsmOp,
 {
     fn read(&mut self, start: Lsn) -> Result<Box<dyn Iterator<Item = LogRecord<Op>>>> {
         let files = read_dir_logs(&self.dir)?;
@@ -287,7 +290,7 @@ struct WriteInner<Op> {
 
 impl<Op> WriteInner<Op>
 where
-    Op: Send + Sync + Clone + Serialize + 'static,
+    Op: FsmOp,
 {
     fn open_log_file(start_lsn: Lsn, options: &FileLogOptions) -> Result<SingleLogFile> {
         log::info!("opening new wal file {}", start_lsn);
@@ -495,9 +498,9 @@ where
                 drop(state);
                 // Get error produced by sync thread.
                 let res = t.join().expect("join thread failed");
-                bail!(res.expect_err("should be err when failed"));
+                return Err(res.expect_err("should be err when failed"));
             } else {
-                bail!("unable to sync due to previous error");
+                return Err("unable to sync due to previous error".into());
             }
         }
 
@@ -542,7 +545,7 @@ struct WriteImpl<Op> {
 
 impl<Op> LogWrite<Op> for WriteImpl<Op>
 where
-    Op: Send + Sync + Clone + Serialize + 'static,
+    Op: FsmOp,
 {
     fn init(&mut self, start_lsn: Lsn, sink: Box<dyn Send + Sync + Fn(Lsn)>) -> Result<()> {
         self.inner
@@ -592,7 +595,7 @@ impl LogDiscard for DiscardImpl {
 
 impl<Op> LogCtx<Op>
 where
-    Op: Send + Sync + Clone + Serialize + DeserializeOwned + 'static,
+    Op: FsmOp,
 {
     pub fn file(options: &FileLogOptions) -> Self {
         Self {
@@ -615,9 +618,8 @@ where
 mod tests {
     use crate::{
         tests::{assert_test_op_iter, check_non_blocking, test_op_write, LogSyncWait, TestOp},
-        FileLogOptions, FileSyncPolicy, LogCtx, LogWriteOptions, Lsn,
+        FileLogOptions, FileSyncPolicy, LogCtx, LogWriteOptions, Lsn, Result,
     };
-    use anyhow::Result;
     use itertools::Itertools;
     use std::{
         path::{Path, PathBuf},

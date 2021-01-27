@@ -1,10 +1,9 @@
 mod sample_fsm;
 
-pub use super::*;
-pub use sample_fsm::*;
+use super::*;
 
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crossbeam::channel::Receiver;
-use serde::{Deserialize, Serialize};
 
 use std::{
     io::Write,
@@ -80,13 +79,27 @@ impl LogSyncWait {
 }
 
 // A log entry of TestOp is 18 bytes
-#[derive(Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Debug)]
 pub struct TestOp {
     pub no: Lsn, // equal to Lsn
 }
 
+impl FsmOp for TestOp {
+    fn serialize(&self) -> Vec<u8> {
+        let mut buf = vec![];
+        buf.write_u64::<LittleEndian>(self.no).unwrap();
+        buf
+    }
+
+    fn deserialize(mut buf: &[u8]) -> Result<Self> {
+        assert!(buf.len() == 8);
+        let no = buf.read_u64::<LittleEndian>()?;
+        Ok(TestOp { no })
+    }
+}
+
 // Basic sanity checks for read result.
-pub fn assert_test_op_iter<'a>(iter: impl Iterator<Item = &'a LogRecord<TestOp>>) {
+pub(crate) fn assert_test_op_iter<'a>(iter: impl Iterator<Item = &'a LogRecord<TestOp>>) {
     let mut prev_lsn = None;
     for rec in iter {
         // Check TestOp::no == Lsn.
@@ -100,7 +113,7 @@ pub fn assert_test_op_iter<'a>(iter: impl Iterator<Item = &'a LogRecord<TestOp>>
     }
 }
 
-pub fn test_op_write(w: &mut dyn LogWrite<TestOp>, lsn: Lsn, options: &LogWriteOptions) {
+pub(crate) fn test_op_write(w: &mut dyn LogWrite<TestOp>, lsn: Lsn, options: &LogWriteOptions) {
     w.fire_write(
         &LogRecord {
             op: TestOp { no: lsn },
