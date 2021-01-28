@@ -1,7 +1,6 @@
 use std::{
     ops::{Deref, DerefMut},
     sync::Arc,
-    todo,
 };
 
 pub struct CowArc<T: Clone> {
@@ -47,6 +46,17 @@ impl<T: Clone> DerefMut for CowArc<T> {
 
 #[cfg(test)]
 mod tests {
+    use crate::CowArc;
+    use std::ops::Deref;
+
     #[test]
-    fn cow_arc_basic() {}
+    fn cow_arc_basic() {
+        let c1 = CowArc::new(10i32);
+        let mut c2 = c1.clone();
+        assert_eq!(c1.deref() as *const _, c2.deref() as *const _);
+        *c2 = 20;
+        assert_eq!(*c1, 10);
+        assert_eq!(*c2, 20);
+        assert_ne!(c1.deref() as *const _, c2.deref() as *const _);
+    }
 }

@@ -4,11 +4,12 @@ use std::{
     collections::{btree_map::Entry, BTreeMap},
     marker::PhantomData,
     sync::{Arc, Mutex},
+    todo,
 };
 
 use crate::{
-    CompareAndSwapStatus, CowArc, Kv, RangeBound, RangeIterator, ReadOptions, Result, Snapshot,
-    WriteOptions,
+    CompareAndSwapStatus, CowArc, Kv, Kvp, RangeBound, RangeIterator, ReadOptions, Result,
+    Snapshot, WriteOptions,
 };
 
 struct MemState {
@@ -23,14 +24,45 @@ pub struct MemKv {
     sh_mem: Arc<MemShared>,
 }
 
-struct SnapshotImpl<'a> {
+struct SnapshotImpl {
     tree: CowArc<BTreeMap<Vec<u8>, Vec<u8>>>,
-    _t: PhantomData<&'a ()>,
 }
 
-impl SnapshotImpl<'_> {}
+impl SnapshotImpl {}
 
-impl Snapshot for SnapshotImpl<'_> {}
+impl Snapshot for SnapshotImpl {}
+
+fn snap_impl(s: &dyn Snapshot) -> &SnapshotImpl {
+    unsafe { &*(s as *const dyn Snapshot as *const SnapshotImpl) }
+}
+
+struct RangeIterImpl {
+    tree: CowArc<BTreeMap<Vec<u8>, Vec<u8>>>,
+    range: RangeBound,
+    cur_key: Option<Vec<u8>>, // last valid key returned by iterator
+}
+
+impl Iterator for RangeIterImpl {
+    type Item = Kvp;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        todo!()
+    }
+}
+
+impl RangeIterator for RangeIterImpl {}
+
+impl MemKv {
+    pub fn new() -> Self {
+        Self {
+            sh_mem: Arc::new(MemShared {
+                state: Mutex::new(MemState {
+                    tree: CowArc::new(BTreeMap::new()),
+                }),
+            }),
+        }
+    }
+}
 
 impl Kv for MemKv {
     fn put(&self, _options: &WriteOptions, key: &[u8], value: &[u8]) {
@@ -85,14 +117,12 @@ impl Kv for MemKv {
         let state = self.sh_mem.state.lock().unwrap();
         Box::new(SnapshotImpl {
             tree: state.tree.clone(),
-            _t: Default::default(),
         })
     }
 
     fn get(&self, options: &ReadOptions<'_>, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let v = if let Some(snapshot) = options.snapshot.clone() {
-            let im = unsafe { &*(snapshot as *const dyn Snapshot as *const SnapshotImpl) };
-            im.tree.get(key).cloned()
+        let v = if let Some(snapshot) = options.snapshot.map(snap_impl) {
+            snapshot.tree.get(key).cloned()
         } else {
             let state = self.sh_mem.state.lock().unwrap();
             state.tree.get(key).cloned()
@@ -106,6 +136,17 @@ impl Kv for MemKv {
         options: &ReadOptions<'_>,
         range: RangeBound,
     ) -> Result<Box<dyn RangeIterator>> {
-        todo!()
+        let tree = if let Some(snapshot) = options.snapshot.map(snap_impl) {
+            snapshot.tree.clone()
+        } else {
+            let state = self.sh_mem.state.lock().unwrap();
+            state.tree.clone()
+        };
+
+        Ok(Box::new(RangeIterImpl {
+            cur_key: None,
+            range,
+            tree,
+        }))
     }
 }

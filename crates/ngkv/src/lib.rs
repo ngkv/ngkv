@@ -131,7 +131,12 @@ pub struct RangeBound {
     pub end: Bound<Vec<u8>>,
 }
 
-pub trait RangeIterator: Iterator<Item = (Vec<u8>, Vec<u8>)> {}
+pub struct Kvp {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+pub trait RangeIterator: Iterator<Item = Kvp> {}
 
 pub trait Snapshot {
 }
