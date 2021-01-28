@@ -85,10 +85,10 @@ pub struct TestOp {
 }
 
 impl FsmOp for TestOp {
-    fn serialize(&self) -> Vec<u8> {
+    fn serialize(&self) -> Result<Vec<u8>> {
         let mut buf = vec![];
         buf.write_u64::<LittleEndian>(self.no).unwrap();
-        buf
+        Ok(buf)
     }
 
     fn deserialize(mut buf: &[u8]) -> Result<Self> {
@@ -99,11 +99,11 @@ impl FsmOp for TestOp {
 }
 
 // Basic sanity checks for read result.
-pub(crate) fn assert_test_op_iter<'a>(iter: impl Iterator<Item = &'a LogRecord<TestOp>>) {
+pub(crate) fn assert_test_op_iter<'a>(iter: impl Iterator<Item = &'a LogRecord>) {
     let mut prev_lsn = None;
     for rec in iter {
         // Check TestOp::no == Lsn.
-        assert_eq!(rec.op.no, rec.lsn);
+        assert_eq!(TestOp::deserialize(&rec.op).unwrap().no, rec.lsn);
 
         // Check Lsn consecutive.
         if let Some(prev) = prev_lsn {
@@ -113,10 +113,10 @@ pub(crate) fn assert_test_op_iter<'a>(iter: impl Iterator<Item = &'a LogRecord<T
     }
 }
 
-pub(crate) fn test_op_write(w: &mut dyn LogWrite<TestOp>, lsn: Lsn, options: &LogWriteOptions) {
+pub(crate) fn test_op_write(w: &mut dyn LogWrite, lsn: Lsn, options: &LogWriteOptions) {
     w.fire_write(
-        &LogRecord {
-            op: TestOp { no: lsn },
+        LogRecord {
+            op: TestOp { no: lsn }.serialize().unwrap(),
             lsn,
         },
         options,

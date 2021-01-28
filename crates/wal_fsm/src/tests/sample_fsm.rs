@@ -19,6 +19,17 @@ pub enum SampleOp {
     AddOne, // add one, return result
 }
 
+impl FsmOp for SampleOp {
+    fn serialize(&self) -> Result<Vec<u8>> {
+        Ok(vec![0xcc])
+    }
+
+    fn deserialize(buf: &[u8]) -> Result<Self> {
+        assert!(buf[0] == 0xcc);
+        Ok(SampleOp::AddOne)
+    }
+}
+
 pub struct SampleStorage {
     data: Mutex<(Lsn, i32)>,
 }

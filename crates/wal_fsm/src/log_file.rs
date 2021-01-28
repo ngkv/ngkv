@@ -3,7 +3,6 @@ use std::{
     convert::TryFrom,
     fs::{read_dir, remove_file, File, OpenOptions},
     io::{BufReader, BufWriter, Read, Write},
-    marker::PhantomData,
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex, MutexGuard},
     thread::{spawn, JoinHandle},
@@ -16,7 +15,7 @@ use once_cell::sync::OnceCell;
 
 use crate::{
     crc32_io::{Crc32Read, Crc32Write},
-    Error, FsmOp, LogCtx, LogDiscard, LogRead, LogRecord, LogWrite, LogWriteOptions, Lsn, Result,
+    Error, LogCtx, LogDiscard, LogRead, LogRecord, LogWrite, LogWriteOptions, Lsn, Result,
 };
 
 #[derive(Clone)]
@@ -43,6 +42,7 @@ pub enum FileSyncPolicy {
 const MAGIC: u8 = 0xef;
 
 #[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum LogEntryType {
     Default = 0, // bincode encoding
 }
@@ -87,8 +87,8 @@ fn read_dir_logs(dir: &Path) -> Result<Vec<FileInfo>> {
 //
 // Note that it never fails, corrupted entry & all entries after it are
 // discarded.
-fn read_record<Op: FsmOp>(mut reader: impl Read) -> Option<Op> {
-    let result = || -> Result<Option<Op>> {
+fn read_record(mut reader: impl Read) -> Option<Vec<u8>> {
+    let result = || -> Result<Option<Vec<u8>>> {
         // Following reads (until CRC itself) would be covered by CRC.
         let mut reader_crc = Crc32Read::new(&mut reader);
 
@@ -97,11 +97,12 @@ fn read_record<Op: FsmOp>(mut reader: impl Read) -> Option<Op> {
             x => x?,
         };
         if magic != MAGIC {
-            return Err("magic mismatch".into());
+            return Ok(None);
         }
 
         // Read type.
         let typ = LogEntryType::try_from(reader_crc.read_u8()?)?;
+        assert!(typ == LogEntryType::Default);
 
         // Read payload.
         let payload_len = reader_crc.read_u32::<LittleEndian>()?;
@@ -112,28 +113,19 @@ fn read_record<Op: FsmOp>(mut reader: impl Read) -> Option<Op> {
         let crc_actual = reader_crc.finalize();
         let crc_expect = reader.read_u32::<LittleEndian>()?;
         if crc_actual != crc_expect {
-            return Err("crc mismatch".into());
+            return Err(Error::Corrupted("crc mismatch".into()));
         }
 
-        let op: Op = match typ {
-            LogEntryType::Default => Op::deserialize(&payload_buf)?,
-        };
-
-        Ok(Some(op))
+        Ok(Some(payload_buf))
     }();
 
     match result {
         Ok(op) => op,
         Err(e) => {
-            log::info!("log record read error: {}", e);
+            log::error!("log record read error: {}", e);
             None
         }
     }
-}
-
-// Serialize an op. Works together with write_record.
-fn serialize_op<Op: FsmOp>(op: &Op) -> Result<Vec<u8>> {
-    Ok(op.serialize())
 }
 
 fn record_size(payload_size: u64) -> u64 {
@@ -180,18 +172,16 @@ fn make_file_name(start_lsn: Lsn) -> String {
     format!("log-{}", start_lsn)
 }
 
-struct ReadLogIter<R, Op> {
+struct ReadLogIter<R> {
     reader: R,
     next_lsn: Lsn,
-    _op: PhantomData<Op>,
 }
 
-impl<R, Op> Iterator for ReadLogIter<R, Op>
+impl<R> Iterator for ReadLogIter<R>
 where
     R: Read,
-    Op: FsmOp,
 {
-    type Item = LogRecord<Op>;
+    type Item = LogRecord;
 
     fn next(&mut self) -> Option<Self::Item> {
         let lsn = self.next_lsn;
@@ -209,30 +199,23 @@ struct FileInfo {
 }
 
 impl FileInfo {
-    fn iter_logs<Op>(self) -> impl Iterator<Item = LogRecord<Op>>
-    where
-        Op: FsmOp,
-    {
+    fn iter_logs(self) -> impl Iterator<Item = LogRecord> {
         log::info!("iterating file {}", self.start_lsn);
         let reader = BufReader::new(self.file);
         ReadLogIter {
             reader,
             next_lsn: self.start_lsn,
-            _op: PhantomData::default(),
         }
     }
 }
 
-struct ReadImpl<Op> {
+struct ReadImpl {
     dir: PathBuf,
-    _op: PhantomData<Op>,
 }
 
-impl<Op> LogRead<Op> for ReadImpl<Op>
-where
-    Op: FsmOp,
+impl LogRead for ReadImpl
 {
-    fn read(&mut self, start: Lsn) -> Result<Box<dyn Iterator<Item = LogRecord<Op>>>> {
+    fn read(&mut self, start: Lsn) -> Result<Box<dyn Iterator<Item = LogRecord>>> {
         let files = read_dir_logs(&self.dir)?;
 
         let (higher, lower): (Vec<_>, Vec<_>) =
@@ -282,15 +265,12 @@ struct WriteSyncShared {
     state: Mutex<WriteSyncState>,
 }
 
-struct WriteInner<Op> {
+struct WriteInner {
     sync_thread: Option<JoinHandle<Result<()>>>,
     sync_shared: Arc<WriteSyncShared>,
-    _op: PhantomData<Op>,
 }
 
-impl<Op> WriteInner<Op>
-where
-    Op: FsmOp,
+impl WriteInner
 {
     fn open_log_file(start_lsn: Lsn, options: &FileLogOptions) -> Result<SingleLogFile> {
         log::info!("opening new wal file {}", start_lsn);
@@ -470,7 +450,6 @@ where
         Ok(Self {
             sync_thread: Some(Self::spawn_sync_thread(shared.clone())),
             sync_shared: shared,
-            _op: PhantomData::default(),
         })
     }
 
@@ -485,9 +464,7 @@ where
         state
     }
 
-    fn fire_write(&mut self, op: &Op, lsn: Lsn, options: &LogWriteOptions) -> Result<()> {
-        // Serialize ahead of time to avoid duplicated serialization.
-        let op_buf = serialize_op(op)?;
+    fn fire_write(&mut self, op_buf: &[u8], lsn: Lsn, options: &LogWriteOptions) -> Result<()> {
         let mut state = self.sync_shared.state.lock().unwrap();
 
         log::debug!("firing write {}", lsn);
@@ -530,7 +507,7 @@ where
     }
 }
 
-impl<Op> Drop for WriteInner<Op> {
+impl Drop for WriteInner {
     fn drop(&mut self) {
         let mut state = self.sync_shared.state.lock().unwrap();
         state.killed = true;
@@ -538,14 +515,12 @@ impl<Op> Drop for WriteInner<Op> {
     }
 }
 
-struct WriteImpl<Op> {
+struct WriteImpl {
     options: Option<FileLogOptions>,
-    inner: OnceCell<WriteInner<Op>>,
+    inner: OnceCell<WriteInner>,
 }
 
-impl<Op> LogWrite<Op> for WriteImpl<Op>
-where
-    Op: FsmOp,
+impl LogWrite for WriteImpl
 {
     fn init(&mut self, start_lsn: Lsn, sink: Box<dyn Send + Sync + Fn(Lsn)>) -> Result<()> {
         self.inner
@@ -559,7 +534,7 @@ where
         Ok(())
     }
 
-    fn fire_write(&mut self, rec: &LogRecord<Op>, options: &LogWriteOptions) -> Result<()> {
+    fn fire_write(&mut self, rec: LogRecord, options: &LogWriteOptions) -> Result<()> {
         self.inner
             .get_mut()
             .expect("not init")
@@ -593,15 +568,12 @@ impl LogDiscard for DiscardImpl {
     }
 }
 
-impl<Op> LogCtx<Op>
-where
-    Op: FsmOp,
+impl LogCtx
 {
     pub fn file(options: &FileLogOptions) -> Self {
         Self {
             read: Box::new(ReadImpl {
                 dir: options.dir.clone(),
-                _op: PhantomData::default(),
             }),
             write: Box::new(WriteImpl {
                 inner: OnceCell::new(),
@@ -617,7 +589,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::{
-        tests::{assert_test_op_iter, check_non_blocking, test_op_write, LogSyncWait, TestOp},
+        tests::{assert_test_op_iter, check_non_blocking, test_op_write, LogSyncWait},
         FileLogOptions, FileSyncPolicy, LogCtx, LogWriteOptions, Lsn, Result,
     };
     use itertools::Itertools;
@@ -663,7 +635,7 @@ mod tests {
         let options = test_option_small(dir.path());
 
         {
-            let mut ctx = LogCtx::<TestOp>::file(&options);
+            let mut ctx = LogCtx::file(&options);
             let (mut sync_wait, sync_sink) = LogSyncWait::create();
             ctx.write.init(1, sync_sink).unwrap();
 
@@ -675,7 +647,7 @@ mod tests {
         }
 
         {
-            let mut ctx = LogCtx::<TestOp>::file(&options);
+            let mut ctx = LogCtx::file(&options);
             let read_res = ctx.read.read(0).unwrap().collect_vec();
             assert_eq!(read_res.len(), 3);
             assert_eq!(read_res[0].lsn, 1);
@@ -689,7 +661,7 @@ mod tests {
         let options = test_option_small(dir.path());
 
         {
-            let mut ctx = LogCtx::<TestOp>::file(&options);
+            let mut ctx = LogCtx::file(&options);
             let (mut sync_wait, sync_sink) = LogSyncWait::create();
             ctx.write.init(1, sync_sink).unwrap();
 
@@ -712,7 +684,7 @@ mod tests {
         let options = test_option_small(dir.path());
 
         {
-            let mut ctx = LogCtx::<TestOp>::file(&options);
+            let mut ctx = LogCtx::file(&options);
             let (mut sync_wait, sync_sink) = LogSyncWait::create();
             ctx.write.init(1, sync_sink).unwrap();
 
@@ -735,7 +707,7 @@ mod tests {
         let options = test_option_small(dir.path());
 
         {
-            let mut ctx = LogCtx::<TestOp>::file(&options);
+            let mut ctx = LogCtx::file(&options);
             let (mut sync_wait, sync_sink) = LogSyncWait::create();
             ctx.write.init(1, sync_sink).unwrap();
 
@@ -751,7 +723,7 @@ mod tests {
         let before_discard = get_dir_lsns(&dir.path()).unwrap();
 
         {
-            let mut ctx = LogCtx::<TestOp>::file(&options);
+            let mut ctx = LogCtx::file(&options);
             check_non_blocking(|| {
                 ctx.discard.fire_discard(50).unwrap();
             });
@@ -770,7 +742,7 @@ mod tests {
         );
 
         {
-            let mut ctx = LogCtx::<TestOp>::file(&options);
+            let mut ctx = LogCtx::file(&options);
             let read_res = ctx.read.read(50).unwrap().collect_vec();
             assert_test_op_iter(read_res.iter());
             assert!(read_res[0].lsn <= 50);
@@ -783,7 +755,7 @@ mod tests {
         let options = test_option_small(dir.path());
 
         {
-            let mut ctx = LogCtx::<TestOp>::file(&options);
+            let mut ctx = LogCtx::file(&options);
             let (mut sync_wait, sync_sink) = LogSyncWait::create();
             ctx.write.init(1, sync_sink).unwrap();
 
@@ -806,7 +778,7 @@ mod tests {
         }
 
         {
-            let mut ctx = LogCtx::<TestOp>::file(&options);
+            let mut ctx = LogCtx::file(&options);
             let read_res = ctx.read.read(1).unwrap().collect_vec();
             assert_eq!(read_res.len(), 0);
         }

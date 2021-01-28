@@ -12,9 +12,9 @@ use crate::{LogCtx, LogDiscard, LogRead, LogRecord, LogWrite, LogWriteOptions, L
 use once_cell::sync::OnceCell;
 use smart_default::SmartDefault;
 
-pub struct MemLogStorage<Op>(Arc<StorageShared<Op>>);
+pub struct MemLogStorage(Arc<StorageShared>);
 
-impl<Op> MemLogStorage<Op> {
+impl MemLogStorage {
     pub fn new(sync_delay: Duration) -> Self {
         Self(Arc::new(StorageShared {
             sync_delay,
@@ -28,48 +28,48 @@ impl<Op> MemLogStorage<Op> {
 }
 
 #[derive(Clone)]
-struct MemLogRecord<Op> {
+struct MemLogRecord {
     lsn: Lsn,
-    op: Op,
+    op: Vec<u8>,
 }
 
-struct PendingLog<Op> {
-    op: Op,
+struct PendingLog {
+    op: Vec<u8>,
     lsn: Lsn,
     sync_time: Instant,
 }
 
 #[derive(SmartDefault)]
-struct StorageShared<Op> {
-    records: Mutex<VecDeque<MemLogRecord<Op>>>,
+struct StorageShared {
+    records: Mutex<VecDeque<MemLogRecord>>,
     sync_delay: Duration,
 }
 #[derive(SmartDefault)]
-struct SyncShared<Op> {
-    pendings: Mutex<VecDeque<PendingLog<Op>>>,
+struct SyncShared {
+    pendings: Mutex<VecDeque<PendingLog>>,
     sink: OnceCell<Box<dyn Send + Sync + Fn(Lsn)>>,
     killed: AtomicBool,
     cond: Condvar,
 }
 
-struct ReadDiscardImpl<Op> {
-    stor: Arc<StorageShared<Op>>,
+struct ReadDiscardImpl {
+    stor: Arc<StorageShared>,
 }
 
-impl<Op> ReadDiscardImpl<Op> {
-    fn new(stor: Arc<StorageShared<Op>>) -> Self {
+impl ReadDiscardImpl {
+    fn new(stor: Arc<StorageShared>) -> Self {
         Self { stor }
     }
 }
 
 // LOCK ORDER: sync, stor
-struct WriteImpl<Op> {
-    sync: Arc<SyncShared<Op>>,
+struct WriteImpl {
+    sync: Arc<SyncShared>,
     _sync_thread: JoinHandle<()>,
-    stor: Arc<StorageShared<Op>>,
+    stor: Arc<StorageShared>,
 }
 
-impl<Op> Drop for WriteImpl<Op> {
+impl Drop for WriteImpl {
     fn drop(&mut self) {
         self.sync.killed.store(true, Ordering::Relaxed);
         self.sync.cond.notify_one();
@@ -79,11 +79,8 @@ impl<Op> Drop for WriteImpl<Op> {
     }
 }
 
-impl<Op> WriteImpl<Op> {
-    fn new(stor: Arc<StorageShared<Op>>) -> Self
-    where
-        Op: Send + Sync + 'static,
-    {
+impl WriteImpl {
+    fn new(stor: Arc<StorageShared>) -> Self {
         let sync = Arc::new(SyncShared::default());
 
         let thread = spawn({
@@ -133,6 +130,9 @@ impl<Op> WriteImpl<Op> {
                     }
 
                     stor.records.lock().unwrap().extend(sync_recs);
+
+                    drop(pendings);
+
                     let sync_lsn = sync_lsn.expect("guaranteed by cond var");
                     sync.sink.get().expect("should init first")(sync_lsn);
                 }
@@ -147,10 +147,7 @@ impl<Op> WriteImpl<Op> {
     }
 }
 
-impl<Op> LogWrite<Op> for WriteImpl<Op>
-where
-    Op: Send + Sync + Clone + 'static,
-{
+impl LogWrite for WriteImpl {
     fn init(&mut self, _start_lsn: Lsn, sink: Box<dyn Send + Sync + Fn(Lsn)>) -> Result<()> {
         self.sync
             .sink
@@ -160,11 +157,11 @@ where
         Ok(())
     }
 
-    fn fire_write(&mut self, rec: &LogRecord<Op>, _options: &LogWriteOptions) -> Result<()> {
+    fn fire_write(&mut self, rec: LogRecord, _options: &LogWriteOptions) -> Result<()> {
         let mut pendings = self.sync.pendings.lock().unwrap();
         pendings.push_back(PendingLog {
             lsn: rec.lsn,
-            op: rec.op.clone(),
+            op: rec.op,
             sync_time: Instant::now() + self.stor.sync_delay,
         });
         self.sync.cond.notify_one();
@@ -172,11 +169,8 @@ where
     }
 }
 
-impl<Op> LogRead<Op> for ReadDiscardImpl<Op>
-where
-    Op: Send + Sync + Clone + 'static,
-{
-    fn read(&mut self, start: Lsn) -> Result<Box<dyn Iterator<Item = LogRecord<Op>>>> {
+impl LogRead for ReadDiscardImpl {
+    fn read(&mut self, start: Lsn) -> Result<Box<dyn Iterator<Item = LogRecord>>> {
         let records = self.stor.records.lock().unwrap();
         let res_vec = records
             .iter()
@@ -191,10 +185,7 @@ where
     }
 }
 
-impl<Op> LogDiscard for ReadDiscardImpl<Op>
-where
-    Op: Send + Sync + Clone + 'static,
-{
+impl LogDiscard for ReadDiscardImpl {
     fn fire_discard(&mut self, lsn: Lsn) -> Result<()> {
         let mut records = self.stor.records.lock().unwrap();
         while let Some(rec) = records.front() {
@@ -209,15 +200,12 @@ where
     }
 }
 
-impl<Op> LogCtx<Op>
-where
-    Op: Send + Sync + Clone + 'static,
-{
-    pub fn memory(mem: &mut MemLogStorage<Op>) -> Self {
+impl LogCtx {
+    pub fn memory(mem: &mut MemLogStorage) -> Self {
         Self {
-            write: Box::new(WriteImpl::<Op>::new(mem.0.clone())),
-            read: Box::new(ReadDiscardImpl::<Op>::new(mem.0.clone())),
-            discard: Box::new(ReadDiscardImpl::<Op>::new(mem.0.clone())),
+            write: Box::new(WriteImpl::new(mem.0.clone())),
+            read: Box::new(ReadDiscardImpl::new(mem.0.clone())),
+            discard: Box::new(ReadDiscardImpl::new(mem.0.clone())),
         }
     }
 }
@@ -225,7 +213,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::{
-        tests::{assert_test_op_iter, check_non_blocking, test_op_write, LogSyncWait, TestOp},
+        tests::{assert_test_op_iter, check_non_blocking, test_op_write, LogSyncWait},
         LogCtx, LogWriteOptions, MemLogStorage, Result,
     };
     use std::{thread::sleep, time::Duration, vec};
@@ -234,7 +222,7 @@ mod tests {
     fn mem_log_normal() -> Result<()> {
         let mut stor = MemLogStorage::new(Duration::from_millis(50));
 
-        let mut ctx = LogCtx::<TestOp>::memory(&mut stor);
+        let mut ctx = LogCtx::memory(&mut stor);
         let (mut sync_wait, sync_sink) = LogSyncWait::create();
         ctx.write.init(1, sync_sink)?;
 
@@ -274,7 +262,7 @@ mod tests {
         let mut stor = MemLogStorage::new(Duration::from_millis(50));
 
         {
-            let mut ctx = LogCtx::<TestOp>::memory(&mut stor);
+            let mut ctx = LogCtx::memory(&mut stor);
             ctx.write.init(1, Box::new(|_| {}))?;
             test_op_write(&mut *ctx.write, 1, &LogWriteOptions::default());
             test_op_write(&mut *ctx.write, 2, &LogWriteOptions::default());
@@ -284,7 +272,7 @@ mod tests {
         sleep(Duration::from_millis(100));
 
         {
-            let mut ctx = LogCtx::<TestOp>::memory(&mut stor);
+            let mut ctx = LogCtx::memory(&mut stor);
             let read_res = ctx.read.read(0).unwrap().collect::<Vec<_>>();
             assert_eq!(read_res, vec![]);
         }
@@ -297,7 +285,7 @@ mod tests {
         let mut stor = MemLogStorage::new(Duration::from_millis(50));
 
         {
-            let mut ctx = LogCtx::<TestOp>::memory(&mut stor);
+            let mut ctx = LogCtx::memory(&mut stor);
             let (mut sync_wait, sync_sink) = LogSyncWait::create();
             ctx.write.init(1, sync_sink)?;
             test_op_write(&mut *ctx.write, 4, &LogWriteOptions::default());
@@ -309,7 +297,7 @@ mod tests {
         }
 
         {
-            let mut ctx = LogCtx::<TestOp>::memory(&mut stor);
+            let mut ctx = LogCtx::memory(&mut stor);
             let read_res = ctx.read.read(4)?.collect::<Vec<_>>();
             assert_eq!(read_res.len(), 2);
             assert_eq!(read_res[0].lsn, 4);

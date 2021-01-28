@@ -1,13 +1,13 @@
 use crate::{Lsn, Result};
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct LogRecord<Op> {
-    pub op: Op,
+pub(crate) struct LogRecord {
+    pub op: Vec<u8>,
     pub lsn: Lsn,
 }
 
-pub(crate) trait LogRead<Op>: Send + Sync {
-    fn read(&mut self, start: Lsn) -> Result<Box<dyn Iterator<Item = LogRecord<Op>>>>;
+pub(crate) trait LogRead: Send + Sync {
+    fn read(&mut self, start: Lsn) -> Result<Box<dyn Iterator<Item = LogRecord>>>;
 }
 
 #[derive(Default)]
@@ -15,9 +15,9 @@ pub(crate) struct LogWriteOptions {
     pub force_sync: bool,
 }
 
-pub(crate) trait LogWrite<Op>: Send + Sync {
+pub(crate) trait LogWrite: Send + Sync {
     fn init(&mut self, start_lsn: Lsn, sink: Box<dyn Send + Sync + Fn(Lsn)>) -> Result<()>;
-    fn fire_write(&mut self, rec: &LogRecord<Op>, options: &LogWriteOptions) -> Result<()>; // NOTE: this is fire and forgot
+    fn fire_write(&mut self, rec: LogRecord, options: &LogWriteOptions) -> Result<()>; // NOTE: this is fire and forgot
 }
 
 pub(crate) trait LogDiscard: Send + Sync {
@@ -25,8 +25,8 @@ pub(crate) trait LogDiscard: Send + Sync {
     fn fire_discard(&mut self, lsn: Lsn) -> Result<()>;
 }
 
-pub struct LogCtx<Op> {
-    pub(crate) read: Box<dyn LogRead<Op>>,
-    pub(crate) write: Box<dyn LogWrite<Op>>,
+pub struct LogCtx {
+    pub(crate) read: Box<dyn LogRead>,
+    pub(crate) write: Box<dyn LogWrite>,
     pub(crate) discard: Box<dyn LogDiscard>,
 }

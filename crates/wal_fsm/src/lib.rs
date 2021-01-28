@@ -30,6 +30,8 @@ pub enum Error {
     Io(#[from] io::Error),
     #[error("reportable bug: {0}")]
     ReportableBug(String),
+    #[error("data corrupted: {0}")]
+    Corrupted(String),
 }
 
 impl From<&str> for Error {
@@ -39,7 +41,7 @@ impl From<&str> for Error {
 }
 
 pub trait FsmOp: Send + Sync + Sized + 'static {
-    fn serialize(&self) -> Vec<u8>;
+    fn serialize(&self) -> Result<Vec<u8>>;
     fn deserialize(buf: &[u8]) -> Result<Self>;
 }
 
@@ -57,15 +59,15 @@ struct PendingApply {
     cond: Condvar,
 }
 
-struct LoggedState<Op> {
+struct LoggedState {
     next_lsn: Lsn,
-    log_write: Box<dyn LogWrite<Op>>,
+    log_write: Box<dyn LogWrite>,
     log_discard: Box<dyn LogDiscard>,
     pending_applies: VecDeque<Arc<PendingApply>>,
 }
 
 struct LoggedInner<S: Fsm> {
-    state: Mutex<LoggedState<S::Op>>,
+    state: Mutex<LoggedState>,
     sm: S,
 }
 
@@ -118,7 +120,7 @@ impl<S: Fsm> LoggedInner<S> {
 }
 
 impl<S: Fsm> WalFsm<S> {
-    pub fn new(sm: S, log_ctx: LogCtx<S::Op>) -> Result<Self> {
+    pub fn new(sm: S, log_ctx: LogCtx) -> Result<Self> {
         let this = Arc::new(LoggedInner {
             sm,
             state: Mutex::new(LoggedState {
@@ -148,7 +150,10 @@ impl<S: Fsm> WalFsm<S> {
             let mut log_read = log_ctx.read;
             for rec in log_read.read(next_lsn)? {
                 assert_eq!(rec.lsn, state.next_lsn);
-                this.sm.apply(rec.op, state.next_lsn);
+                this.sm.apply(
+                    S::Op::deserialize(&rec.op).expect("deserialize failed"),
+                    state.next_lsn,
+                );
                 state.next_lsn += 1;
             }
 
@@ -167,6 +172,8 @@ impl<S: Fsm> WalFsm<S> {
     }
 
     pub fn apply(&self, op: S::Op, options: ApplyOptions) {
+        let op_buf = op.serialize().expect("error during serialization");
+
         let mut state = self.0.state.lock().unwrap();
         let lsn = state.next_lsn;
         state.next_lsn += 1;
@@ -184,13 +191,11 @@ impl<S: Fsm> WalFsm<S> {
             state.pending_applies.push_back(pending);
         }
 
-        let rec = LogRecord { op, lsn };
-
         // TODO handle log write error
         state
             .log_write
             .fire_write(
-                &rec,
+                LogRecord { op: op_buf, lsn },
                 &LogWriteOptions {
                     force_sync: options.is_sync,
                 },
@@ -205,6 +210,6 @@ impl<S: Fsm> WalFsm<S> {
             }
         }
 
-        self.0.sm.apply(rec.op, lsn)
+        self.0.sm.apply(op, lsn)
     }
 }
