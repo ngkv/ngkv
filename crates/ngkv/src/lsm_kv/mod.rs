@@ -1,6 +1,6 @@
-mod meta;
+mod version_set;
 
-use self::meta::*;
+use self::version_set::*;
 
 use std::{
     convert::TryFrom,

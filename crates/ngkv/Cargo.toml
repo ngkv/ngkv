@@ -14,6 +14,8 @@ crc32fast = "1.2.1"
 log = "0.4.13"
 thiserror = "1.0.23"
 once_cell = "1.5.2"
+bincode = "1.3.1"
+serde = { version = "1.0.123", features = ["derive"] }
 
 [dev-dependencies]
 rand = "0.8.3"
