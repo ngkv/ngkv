@@ -1,17 +1,21 @@
+mod meta;
+
+use self::meta::*;
+
 use std::{
     convert::TryFrom,
     io::{self, Cursor, Read, Write},
+    todo,
 };
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
+use once_cell::sync::OnceCell;
 use wal_fsm::{Fsm, FsmOp, WalFsm};
 
 use crate::{VarintRead, VarintWrite};
 
-struct KvFsm {}
-
 #[derive(Clone)]
-enum KvFsmOp {
+enum KvOp {
     Put { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
 }
@@ -36,16 +40,16 @@ fn deserialize_buf(mut r: impl Read) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-impl FsmOp for KvFsmOp {
+impl FsmOp for KvOp {
     fn serialize(&self) -> wal_fsm::Result<Vec<u8>> {
         let mut cursor = Cursor::new(vec![]);
         match self {
-            KvFsmOp::Put { key, value } => {
+            KvOp::Put { key, value } => {
                 cursor.write_u8(OpType::Put as u8)?;
                 serialize_buf(&mut cursor, key)?;
                 serialize_buf(&mut cursor, value)?;
             }
-            KvFsmOp::Delete { key } => {
+            KvOp::Delete { key } => {
                 cursor.write_u8(OpType::Delete as u8)?;
                 serialize_buf(&mut cursor, key)?;
             }
@@ -72,10 +76,15 @@ impl FsmOp for KvFsmOp {
     }
 }
 
+struct KvFsm {
+    sink: OnceCell<Box<dyn wal_fsm::ReportSink>>,
+}
+
 impl Fsm for KvFsm {
-    type Op = KvFsmOp;
+    type Op = KvOp;
 
     fn init(&self, sink: Box<dyn wal_fsm::ReportSink>) -> wal_fsm::Init {
+        self.sink.set(sink).map_err(|_| ()).expect("already init");
         todo!()
     }
 
