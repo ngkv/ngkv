@@ -1,15 +1,12 @@
 use std::{
-    any::Any,
-    borrow::Cow,
     collections::{btree_map::Entry, BTreeMap},
-    marker::PhantomData,
+    ops::{Deref, RangeBounds},
     sync::{Arc, Mutex},
-    todo,
 };
 
 use crate::{
-    CompareAndSwapStatus, CowArc, Kv, Kvp, RangeBound, RangeIterator, ReadOptions, Result,
-    Snapshot, WriteOptions,
+    CompareAndSwapStatus, CowArc, Kv, Kvp, RangeIterator, ReadOptions, Result, Snapshot,
+    WriteOptions,
 };
 
 struct MemState {
@@ -32,21 +29,50 @@ impl SnapshotImpl {}
 
 impl Snapshot for SnapshotImpl {}
 
+/// Downcast snapshot into impl.
 fn snap_impl(s: &dyn Snapshot) -> &SnapshotImpl {
     unsafe { &*(s as *const dyn Snapshot as *const SnapshotImpl) }
 }
 
 struct RangeIterImpl {
-    tree: CowArc<BTreeMap<Vec<u8>, Vec<u8>>>,
-    range: RangeBound,
-    cur_key: Option<Vec<u8>>, // last valid key returned by iterator
+    /// Guarantees `iter` is valid.
+    _tree: CowArc<BTreeMap<Vec<u8>, Vec<u8>>>,
+
+    /// Lifetime is not really static here, but is the same as `_tree`.
+    iter: Box<dyn DoubleEndedIterator<Item = (&'static Vec<u8>, &'static Vec<u8>)>>,
+}
+
+fn map_item(i: Option<(&Vec<u8>, &Vec<u8>)>) -> Option<Result<Kvp>> {
+    i.map(|(k, v)| {
+        Ok(Kvp {
+            key: k.to_owned(),
+            value: v.to_owned(),
+        })
+    })
 }
 
 impl Iterator for RangeIterImpl {
-    type Item = Kvp;
+    type Item = Result<Kvp>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        map_item(self.iter.next())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
+    }
+
+    fn last(self) -> Option<Self::Item>
+    where
+        Self: Sized,
+    {
+        map_item(self.iter.last())
+    }
+}
+
+impl DoubleEndedIterator for RangeIterImpl {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        map_item(self.iter.next_back())
     }
 }
 
@@ -65,14 +91,16 @@ impl MemKv {
 }
 
 impl Kv for MemKv {
-    fn put(&self, _options: &WriteOptions, key: &[u8], value: &[u8]) {
+    fn put(&self, _options: &WriteOptions, key: &[u8], value: &[u8]) -> Result<()> {
         let mut state = self.sh_mem.state.lock().unwrap();
         state.tree.insert(key.to_owned(), value.to_owned());
+        Ok(())
     }
 
-    fn delete(&self, _options: &WriteOptions, key: &[u8]) {
+    fn delete(&self, _options: &WriteOptions, key: &[u8]) -> Result<()> {
         let mut state = self.sh_mem.state.lock().unwrap();
         state.tree.remove(key);
+        Ok(())
     }
 
     fn compare_and_swap(
@@ -134,8 +162,8 @@ impl Kv for MemKv {
     fn range(
         &self,
         options: &ReadOptions<'_>,
-        range: RangeBound,
-    ) -> Result<Box<dyn RangeIterator>> {
+        range: impl RangeBounds<Vec<u8>>,
+    ) -> Result<Box<dyn '_ + RangeIterator>> {
         let tree = if let Some(snapshot) = options.snapshot.map(snap_impl) {
             snapshot.tree.clone()
         } else {
@@ -143,10 +171,75 @@ impl Kv for MemKv {
             state.tree.clone()
         };
 
+        // SAFETY: Tree outlives iterator, and tree.deref() never changes
+        // because of readonly access.
+        let tree_ref: &'static BTreeMap<Vec<u8>, Vec<u8>> = unsafe { &*(tree.deref() as *const _) };
+
         Ok(Box::new(RangeIterImpl {
-            cur_key: None,
-            range,
-            tree,
+            _tree: tree,
+            iter: Box::new(tree_ref.range(range)),
         }))
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mem_kv_put_get() {
+        let value = "Hello world!";
+        let kv = MemKv::new();
+
+        kv.put(
+            &WriteOptions::default(),
+            "test".as_bytes(),
+            value.as_bytes(),
+        )
+        .unwrap();
+
+        let get_res = kv
+            .get(&ReadOptions::default(), "test".as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(get_res, value.as_bytes());
+    }
+
+    #[test]
+    fn mem_kv_snapshot_read() {
+        let value = "Hello world!";
+        let kv = MemKv::new();
+
+        kv.put(
+            &WriteOptions::default(),
+            "test".as_bytes(),
+            value.as_bytes(),
+        )
+        .unwrap();
+
+        let snap = kv.snapshot();
+
+        kv.delete(&WriteOptions::default(), "test".as_bytes())
+            .unwrap();
+
+        // Test non-snapshot read.
+        assert!(kv
+            .get(&ReadOptions::default(), "test".as_bytes())
+            .unwrap()
+            .is_none());
+
+        // Test snapshot read.
+        let get_res = kv
+            .get(
+                &ReadOptions {
+                    snapshot: Some(&*snap),
+                },
+                "test".as_bytes(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(get_res, value.as_bytes());
+    }
+
+    // TODO: test range read.
 }
