@@ -213,8 +213,7 @@ struct ReadImpl {
     dir: PathBuf,
 }
 
-impl LogRead for ReadImpl
-{
+impl LogRead for ReadImpl {
     fn read(&mut self, start: Lsn) -> Result<Box<dyn Iterator<Item = LogRecord>>> {
         let files = read_dir_logs(&self.dir)?;
 
@@ -258,7 +257,7 @@ struct WriteSyncState {
 struct WriteSyncShared {
     options: FileLogOptions,
     cv_has_pending: Condvar,
-    cv_log_switch: Condvar,
+    cv_writable: Condvar,
     // killed: AtomicBool,
     // failed: AtomicBool,
     sink: Box<dyn Send + Sync + Fn(Lsn)>,
@@ -270,8 +269,7 @@ struct WriteInner {
     sync_shared: Arc<WriteSyncShared>,
 }
 
-impl WriteInner
-{
+impl WriteInner {
     fn open_log_file(start_lsn: Lsn, options: &FileLogOptions) -> Result<SingleLogFile> {
         log::info!("opening new wal file {}", start_lsn);
         let name = make_file_name(start_lsn);
@@ -318,17 +316,17 @@ impl WriteInner
                 // We have pending writes. Sync them when:
                 // 1. Asked by the write options (i.e. force_sync flag).
                 // 2. Time to do periodical sync.
-                // 3. Log file should be switched.
+                // 3. Log file is no longer writable.
                 let case_sync_time = now >= next_sync_time;
                 let case_force_sync = state.cur_file.request_force_sync;
-                let case_log_switch = state.cur_file.written >= sync.options.log_switch_size;
+                let case_log_not_writable = !Self::is_writable(sync, &state);
                 log::debug!(
-                    "sync_time: {}, force_sync: {}, log_switch: {}",
+                    "sync_time: {}, force_sync: {}, not_writable: {}",
                     case_sync_time,
                     case_force_sync,
-                    case_log_switch
+                    case_log_not_writable
                 );
-                if case_sync_time || case_force_sync || case_log_switch {
+                if case_sync_time || case_force_sync || case_log_not_writable {
                     // We should sync now.
                     break;
                 } else {
@@ -408,12 +406,12 @@ impl WriteInner
 
                         match res {
                             Ok(_) => {
-                                sync.cv_log_switch.notify_all();
+                                sync.cv_writable.notify_all();
                             }
                             Err(e) => {
                                 log::error!("sync failed: {}", e);
                                 state.failed = true;
-                                sync.cv_log_switch.notify_all();
+                                sync.cv_writable.notify_all();
                                 return Err(e);
                             }
                         }
@@ -442,7 +440,7 @@ impl WriteInner
         let shared = Arc::new(WriteSyncShared {
             options,
             cv_has_pending: Default::default(),
-            cv_log_switch: Default::default(),
+            cv_writable: Default::default(),
             sink,
             state: Mutex::new(state),
         });
@@ -453,13 +451,20 @@ impl WriteInner
         })
     }
 
+    fn is_writable(sync: &WriteSyncShared, state: &WriteSyncState) -> bool {
+        let cur_file = &state.cur_file;
+        let options = &sync.options;
+        cur_file.written < options.log_switch_size
+            && cur_file.pending_lsn - cur_file.sync_lsn < options.max_pending
+    }
+
     fn wait_for_fail_or_writable<'a>(
         sync: &WriteSyncShared,
         mut state: MutexGuard<'a, WriteSyncState>,
     ) -> MutexGuard<'a, WriteSyncState> {
-        while !state.failed && state.cur_file.written >= sync.options.log_switch_size {
+        while !state.failed && !Self::is_writable(sync, &state) {
             log::debug!("waiting for log switch, size={}", state.cur_file.size);
-            state = sync.cv_log_switch.wait(state).unwrap();
+            state = sync.cv_writable.wait(state).unwrap();
         }
         state
     }
@@ -481,7 +486,7 @@ impl WriteInner
             }
         }
 
-        assert!(state.cur_file.written < self.sync_shared.options.log_switch_size);
+        assert!(Self::is_writable(&*self.sync_shared, &state));
 
         let space_remain = state.cur_file.size - state.cur_file.written;
         let rec_size = record_size(op_buf.len() as u64);
@@ -520,8 +525,7 @@ struct WriteImpl {
     inner: OnceCell<WriteInner>,
 }
 
-impl LogWrite for WriteImpl
-{
+impl LogWrite for WriteImpl {
     fn init(&mut self, start_lsn: Lsn, sink: Box<dyn Send + Sync + Fn(Lsn)>) -> Result<()> {
         self.inner
             .set(WriteInner::new(
@@ -568,8 +572,7 @@ impl LogDiscard for DiscardImpl {
     }
 }
 
-impl LogCtx
-{
+impl LogCtx {
     pub fn file(options: &FileLogOptions) -> Self {
         Self {
             read: Box::new(ReadImpl {
