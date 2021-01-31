@@ -34,8 +34,12 @@ fn temp_file_path(dir: &Path) -> PathBuf {
     PathBuf::from(dir).join(format!("temp-{}", uuid::Uuid::new_v4().to_simple()))
 }
 
-fn log_dir(dir: &Path) -> PathBuf {
-    PathBuf::from(dir).join("wal")
+fn log_dir(parent_dir: &Path) -> Result<PathBuf> {
+    let dir = PathBuf::from(parent_dir).join("wal");
+    if !dir.is_dir() {
+        fs::create_dir(&dir)?;
+    }
+    Ok(dir)
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -440,12 +444,12 @@ impl VersionEditBuilder {
     }
 
     pub fn add_sst(
-        &mut self,
+        mut self,
         id: u32,
         level: u32,
         lsn_range: (Lsn, Lsn),
         key_range: (Vec<u8>, Vec<u8>),
-    ) {
+    ) -> Self {
         self.sst_add.push(SstMetaRaw {
             id,
             level,
@@ -454,16 +458,18 @@ impl VersionEditBuilder {
             key_lo: key_range.0,
             key_hi: key_range.1,
         });
+        self
     }
 
-    pub fn del_sst(&mut self, id: u32) {
+    pub fn del_sst(mut self, id: u32) -> Self {
         self.sst_del.push(id);
+        self
     }
 
     pub fn build(self) -> VersionEdit {
         VersionEdit {
             op: VersionOp {
-                sst_add: self.sst_add,
+                sst_add: self.sst_add.clone(),
                 sst_del: self.sst_del,
             },
         }
@@ -495,7 +501,7 @@ impl VersionSet {
                         }),
                     }),
                 },
-                wal_fsm::LogCtx::file(&file_log_options(log_dir(dir))),
+                wal_fsm::LogCtx::file(&file_log_options(log_dir(dir)?)),
             )?,
         })
     }
@@ -539,7 +545,7 @@ impl VersionSet {
     }
 
     /// Log and durably apply a version edit.
-    pub fn log_and_appy(&self, edit: VersionEdit) -> Result<()> {
+    pub fn log_and_apply(&self, edit: VersionEdit) -> Result<()> {
         self.fsm
             .apply(edit.op, wal_fsm::ApplyOptions { is_sync: true })?;
         Ok(())
@@ -548,5 +554,48 @@ impl VersionSet {
     // TODO: pick compaction
     pub fn pick_compaction(&self) -> Option<Compaction> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempdir::TempDir;
+
+    fn temp_dir() -> Result<TempDir> {
+        let dir = TempDir::new("wal_fsm")?;
+        Ok(dir)
+    }
+
+    #[test]
+    fn version_set_simple() {
+        let temp_dir = temp_dir().unwrap();
+
+        let sst_id;
+
+        let lsn_range = (100, 200);
+        let key_range = (vec![10], vec![20]);
+
+        {
+            let vs = VersionSet::new(temp_dir.path()).unwrap();
+            sst_id = vs.new_sst_id();
+            let edit = VersionEditBuilder::new()
+                .add_sst(sst_id, 0, lsn_range, key_range.clone())
+                .build();
+            vs.log_and_apply(edit).unwrap();
+        }
+
+        {
+            let vs = VersionSet::new(temp_dir.path()).unwrap();
+            let version = vs.get_version(None);
+            let levels = version.levels();
+
+            let l0_ssts = levels[0].ssts();
+            assert_eq!(l0_ssts.len(), 1);
+
+            let s0 = &l0_ssts[0];
+            assert_eq!(s0.lsn_range(), lsn_range);
+            assert_eq!(s0.key_range(), (&*key_range.0, &*key_range.1));
+        }
     }
 }

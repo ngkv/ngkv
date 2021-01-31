@@ -5,12 +5,7 @@ mod mem_kv;
 mod task_ctl;
 mod varint;
 
-use std::{
-    io,
-    ops::RangeBounds,
-    path::PathBuf,
-    time::Duration,
-};
+use std::{io, ops::RangeBounds, path::PathBuf, time::Duration};
 
 pub use crate::{cow_arc::*, lsm_kv::*, task_ctl::*, varint::*};
 use thiserror::Error;
@@ -105,4 +100,27 @@ pub(crate) fn key_comparator<T, K: Ord + ?Sized>(
     mut f: impl FnMut(&T) -> &K,
 ) -> impl FnMut(&T, &T) -> std::cmp::Ordering {
     move |a, b| f(a).cmp(f(b))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    #[ctor::ctor]
+    fn init_logger() {
+        let _ = env_logger::builder()
+            .format(|buf, record| {
+                writeln!(
+                    buf,
+                    "{}:{} {} [{}] - {}",
+                    record.file().unwrap_or("unknown"),
+                    record.line().unwrap_or(0),
+                    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S"),
+                    record.level(),
+                    record.args()
+                )
+            })
+            .is_test(true)
+            .try_init();
+    }
 }
