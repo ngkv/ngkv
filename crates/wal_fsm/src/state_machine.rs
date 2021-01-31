@@ -1,4 +1,6 @@
-use crate::{FsmOp, Lsn, ReportSink};
+use std::error::Error as StdError;
+
+use crate::{FsmOp, Lsn, ReportSink, Result};
 
 pub struct Init {
     pub next_lsn: Lsn,
@@ -6,7 +8,7 @@ pub struct Init {
 
 pub trait Fsm: Send + Sync + 'static {
     type Op: FsmOp;
-    fn init(&self, sink: Box<dyn ReportSink>) -> Init;
-    fn apply(&self, op: Self::Op, lsn: Lsn);
+    type E: StdError;
+    fn init(&self, sink: Box<dyn ReportSink>) -> Result<Init, Self::E>;
+    fn apply(&self, op: Self::Op, lsn: Lsn) -> Result<(), Self::E>;
 }
-

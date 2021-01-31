@@ -6,6 +6,7 @@ mod state_machine;
 #[cfg(test)]
 mod tests;
 
+use never::Never;
 use thiserror::Error;
 
 // crate
@@ -14,6 +15,8 @@ pub use crate::{log_ctx::*, log_file::*, log_mem::*, state_machine::*};
 // std
 use std::{
     collections::VecDeque,
+    error::Error as StdError,
+    fmt::Debug,
     io,
     ops::Deref,
     sync::{
@@ -22,21 +25,38 @@ use std::{
     },
 };
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub type Result<T, E = Error<Never>> = std::result::Result<T, E>;
 
 #[derive(Error, Debug)]
-pub enum Error {
+pub enum Error<EFsm: StdError + 'static> {
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error("reportable bug: {0}")]
     ReportableBug(String),
     #[error("data corrupted: {0}")]
     Corrupted(String),
+    #[error(transparent)]
+    Fsm(Box<EFsm>),
 }
 
-impl From<&str> for Error {
+impl<EFsm: StdError + 'static> From<&str> for Error<EFsm> {
     fn from(s: &str) -> Self {
         Self::ReportableBug(s.to_string())
+    }
+}
+
+pub(crate) trait ResultNeverExt<T> {
+    fn map_err_never<EFsm: StdError>(self) -> Result<T, Error<EFsm>>;
+}
+
+impl<T> ResultNeverExt<T> for Result<T, Error<Never>> {
+    fn map_err_never<EFsm: StdError>(self) -> Result<T, Error<EFsm>> {
+        self.map_err(|err| match err {
+            Error::Io(e) => Error::Io(e),
+            Error::ReportableBug(e) => Error::ReportableBug(e),
+            Error::Corrupted(e) => Error::Corrupted(e),
+            Error::Fsm(_) => unreachable!(),
+        })
     }
 }
 
@@ -50,7 +70,7 @@ pub trait FsmOp: Send + Sync + Sized + 'static {
 pub type Lsn = u64;
 
 pub trait ReportSink: Send + Sync {
-    fn report_snapshot_lsn(&self, lsn: Lsn);
+    fn report_checkpoint_lsn(&self, lsn: Lsn);
 }
 
 struct PendingApply {
@@ -78,7 +98,7 @@ struct ReportSinkImpl<S: Fsm> {
 }
 
 impl<S: Fsm> ReportSink for ReportSinkImpl<S> {
-    fn report_snapshot_lsn(&self, lsn: Lsn) {
+    fn report_checkpoint_lsn(&self, lsn: Lsn) {
         // update (highest included) snapshot lsn
         // which could be safely discarded
         let this = Weak::upgrade(&self.logged).expect("already destroyed");
@@ -120,7 +140,7 @@ impl<S: Fsm> LoggedInner<S> {
 }
 
 impl<S: Fsm> WalFsm<S> {
-    pub fn new(sm: S, log_ctx: LogCtx) -> Result<Self> {
+    pub fn new(sm: S, log_ctx: LogCtx) -> Result<Self, Error<S::E>> {
         let this = Arc::new(LoggedInner {
             sm,
             state: Mutex::new(LoggedState {
@@ -138,7 +158,7 @@ impl<S: Fsm> WalFsm<S> {
         });
 
         // init state machine (e.g. read from persistent store)
-        let Init { next_lsn } = this.sm.init(sink);
+        let Init { next_lsn } = this.sm.init(sink).map_err(|e| Error::Fsm(Box::new(e)))?;
         assert!(next_lsn >= 1);
 
         {
@@ -148,30 +168,35 @@ impl<S: Fsm> WalFsm<S> {
 
             // replay log
             let mut log_read = log_ctx.read;
-            for rec in log_read.read(next_lsn)? {
+            for rec in log_read.read(next_lsn).map_err_never()? {
                 assert_eq!(rec.lsn, state.next_lsn);
-                this.sm.apply(
-                    S::Op::deserialize(&rec.op).expect("deserialize failed"),
-                    state.next_lsn,
-                );
+                this.sm
+                    .apply(
+                        S::Op::deserialize(&rec.op).expect("deserialize failed"),
+                        state.next_lsn,
+                    )
+                    .map_err(|e| Error::Fsm(Box::new(e)))?;
                 state.next_lsn += 1;
             }
 
             // set sink for log writer sync
             let next_lsn = state.next_lsn;
-            state.log_write.init(
-                next_lsn,
-                Box::new(move |lsn| {
-                    let this = this_weak.upgrade().expect("already destroyed");
-                    this.finalize_pending(lsn);
-                }),
-            )?;
+            state
+                .log_write
+                .init(
+                    next_lsn,
+                    Box::new(move |lsn| {
+                        let this = this_weak.upgrade().expect("already destroyed");
+                        this.finalize_pending(lsn);
+                    }),
+                )
+                .map_err_never()?;
         }
 
         Ok(WalFsm(this))
     }
 
-    pub fn apply(&self, op: S::Op, options: ApplyOptions) {
+    pub fn apply(&self, op: S::Op, options: ApplyOptions) -> Result<(), Error<S::E>> {
         let op_buf = op.serialize().expect("error during serialization");
 
         let mut state = self.0.state.lock().unwrap();
@@ -210,6 +235,6 @@ impl<S: Fsm> WalFsm<S> {
             }
         }
 
-        self.0.sm.apply(op, lsn)
+        self.0.sm.apply(op, lsn).map_err(|e| Error::Fsm(Box::new(e)))
     }
 }

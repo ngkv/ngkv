@@ -1,17 +1,23 @@
 mod cow_arc;
 mod lsm_kv;
+#[cfg(test)]
 mod mem_kv;
+mod task_ctl;
 mod varint;
 
 use std::{
     io,
-    ops::{Bound, RangeBounds},
+    ops::RangeBounds,
+    path::PathBuf,
+    time::Duration,
 };
 
-pub use crate::{cow_arc::*, lsm_kv::*, varint::*};
+pub use crate::{cow_arc::*, lsm_kv::*, task_ctl::*, varint::*};
 use thiserror::Error;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+pub type Lsn = wal_fsm::Lsn;
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -22,7 +28,13 @@ pub enum Error {
     #[error("data corrupted: {0}")]
     Corrupted(String),
     #[error(transparent)]
-    Wal(#[from] wal_fsm::Error),
+    Wal(Box<wal_fsm::Error<Error>>),
+}
+
+impl From<wal_fsm::Error<Error>> for Error {
+    fn from(e: wal_fsm::Error<Error>) -> Self {
+        Error::Wal(Box::new(e))
+    }
 }
 
 #[derive(Default)]
@@ -40,11 +52,7 @@ pub enum CompareAndSwapStatus {
     CurrentMismatch { cur_value: Option<Vec<u8>> },
 }
 
-struct RangeBoundImpl {
-    start: Bound<Vec<u8>>,
-    end: Bound<Vec<u8>>,
-}
-
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Kvp {
     pub key: Vec<u8>,
     pub value: Vec<u8>,
@@ -76,4 +84,25 @@ pub trait Kv {
         options: &ReadOptions<'_>,
         range: impl RangeBounds<Vec<u8>>,
     ) -> Result<Box<dyn '_ + RangeIterator>>;
+}
+
+pub(crate) unsafe fn _override_lifetime<'a, 'b, T>(t: &'a T) -> &'b T {
+    std::mem::transmute(t)
+}
+
+pub(crate) fn file_log_options(dir: PathBuf) -> wal_fsm::FileLogOptions {
+    wal_fsm::FileLogOptions {
+        dir,
+        log_step_size: 1 << 20,    // 1MB
+        log_switch_size: 10 << 20, // 10MB
+        max_pending: 1024,
+        sync_policy: wal_fsm::FileSyncPolicy::Periodical(Duration::from_secs(1)),
+    }
+}
+
+/// Workaround of the `sort_by_key` lifetime issue.
+pub(crate) fn key_comparator<T, K: Ord + ?Sized>(
+    mut f: impl FnMut(&T) -> &K,
+) -> impl FnMut(&T, &T) -> std::cmp::Ordering {
+    move |a, b| f(a).cmp(f(b))
 }

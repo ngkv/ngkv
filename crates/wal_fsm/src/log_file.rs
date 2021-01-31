@@ -13,10 +13,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use itertools::Itertools;
 use once_cell::sync::OnceCell;
 
-use crate::{
-    crc32_io::{Crc32Read, Crc32Write},
-    Error, LogCtx, LogDiscard, LogRead, LogRecord, LogWrite, LogWriteOptions, Lsn, Result,
-};
+use crate::{Error, LogCtx, LogDiscard, LogRead, LogRecord, LogWrite, LogWriteOptions, Lsn, Never, Result, crc32_io::{Crc32Read, Crc32Write}};
 
 #[derive(Clone)]
 pub struct FileLogOptions {
@@ -48,7 +45,7 @@ enum LogEntryType {
 }
 
 impl TryFrom<u8> for LogEntryType {
-    type Error = Error;
+    type Error = Error<Never>;
 
     fn try_from(v: u8) -> Result<Self> {
         match v {

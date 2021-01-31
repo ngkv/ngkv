@@ -99,7 +99,7 @@ impl SampleStateMachineInner {
                     self.sink
                         .get()
                         .expect("should be initialized")
-                        .report_snapshot_lsn(lsn);
+                        .report_checkpoint_lsn(lsn);
                 }
                 i if i == op_kill => {
                     op.recv(&kill_recv).unwrap();
@@ -150,9 +150,10 @@ impl Drop for SampleStateMachine {
 }
 
 impl Fsm for SampleStateMachine {
+    type E = Never;
     type Op = SampleOp;
 
-    fn init(&self, sink: Box<dyn ReportSink>) -> Init {
+    fn init(&self, sink: Box<dyn ReportSink>) -> Result<Init, Self::E> {
         self.0
             .sink
             .set(sink)
@@ -183,27 +184,27 @@ impl Fsm for SampleStateMachine {
             )
             .expect("init called twice");
 
-        Init { next_lsn: lsn + 1 }
+        Ok(Init { next_lsn: lsn + 1 })
     }
 
-    fn apply(&self, op: SampleOp, lsn: Lsn) {
+    fn apply(&self, op: SampleOp, lsn: Lsn) -> Result<(), Self::E> {
         let mut state = self.0.get_state();
 
         assert_eq!(state.lsn + 1, lsn);
         state.lsn = lsn;
 
-        match op {
+        Ok(match op {
             SampleOp::AddOne => {
                 state.num += 1;
             }
-        }
+        })
     }
 }
 
 mock! {
     pub SampleReportSink {}
     impl ReportSink for SampleReportSink {
-        fn report_snapshot_lsn(&self, _lsn: Lsn);
+        fn report_checkpoint_lsn(&self, _lsn: Lsn);
     }
 }
 
@@ -215,27 +216,27 @@ fn sample_sm_normal() {
 
     let mut mock = MockSampleReportSink::new();
     let mut seq = Sequence::new();
-    mock.expect_report_snapshot_lsn()
+    mock.expect_report_checkpoint_lsn()
         .with(predicate::eq(5))
         .times(1)
         .returning(|_| ())
         .in_sequence(&mut seq);
-    mock.expect_report_snapshot_lsn()
+    mock.expect_report_checkpoint_lsn()
         .with(predicate::eq(6))
         .times(1)
         .returning(|_| ())
         .in_sequence(&mut seq);
 
-    let Init { next_lsn } = sm.init(Box::new(mock));
+    let Init { next_lsn } = sm.init(Box::new(mock)).unwrap();
     assert_eq!(next_lsn, 4);
 
     {
-        sm.apply(SampleOp::AddOne, 4);
+        sm.apply(SampleOp::AddOne, 4).unwrap();
         assert_eq!(sm.get_num(), 2);
     }
 
     {
-        sm.apply(SampleOp::AddOne, 5);
+        sm.apply(SampleOp::AddOne, 5).unwrap();
         assert_eq!(sm.get_num(), 3);
     }
 
@@ -243,7 +244,7 @@ fn sample_sm_normal() {
     sleep(PERSISTER_TEST_WAIT); // wait persister to finish
 
     {
-        sm.apply(SampleOp::AddOne, 6);
+        sm.apply(SampleOp::AddOne, 6).unwrap();
         assert_eq!(sm.get_num(), 4);
     }
 
@@ -269,16 +270,16 @@ fn sample_sm_not_durable() {
     let sm = SampleStateMachine::new(storage.clone());
 
     let mut mock = MockSampleReportSink::new();
-    mock.expect_report_snapshot_lsn()
+    mock.expect_report_checkpoint_lsn()
         .with(predicate::eq(4))
         .times(1)
         .returning(|_| ());
 
-    let Init { next_lsn } = sm.init(Box::new(mock));
+    let Init { next_lsn } = sm.init(Box::new(mock)).unwrap();
     assert_eq!(next_lsn, 4);
 
     {
-        sm.apply(SampleOp::AddOne, 4);
+        sm.apply(SampleOp::AddOne, 4).unwrap();
         assert_eq!(sm.get_num(), 2);
     }
 
@@ -307,18 +308,18 @@ fn logged_sample_sm_normal() -> Result<()> {
     let mut mem_log = MemLogStorage::new(Duration::from_secs(0));
     let logged = WalFsm::new(sm, LogCtx::memory(&mut mem_log))?;
 
-    logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: true });
+    logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: true }).unwrap();
     assert_eq!(logged.get_num(), 2);
 
-    logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: true });
+    logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: true }).unwrap();
     assert_eq!(logged.get_num(), 3);
 
     assert_eq!(mem_log.len(), 2);
 
-    logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: false });
-    logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: false });
+    logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: false }).unwrap();
+    logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: false }).unwrap();
 
-    logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: true });
+    logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: true }).unwrap();
     assert_eq!(logged.get_num(), 6);
 
     logged.fire_persist();
@@ -345,13 +346,21 @@ fn logged_sample_sm_sync_durable() -> Result<()> {
         let logged = WalFsm::new(sm, LogCtx::memory(&mut mem_log))?;
 
         check_blocking(
-            || logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: true }),
+            || {
+                logged
+                    .apply(SampleOp::AddOne, ApplyOptions { is_sync: true })
+                    .unwrap()
+            },
             Duration::from_millis(50),
         );
         assert_eq!(logged.get_num(), 2);
 
         check_blocking(
-            || logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: true }),
+            || {
+                logged
+                    .apply(SampleOp::AddOne, ApplyOptions { is_sync: true })
+                    .unwrap()
+            },
             Duration::from_millis(50),
         );
         assert_eq!(logged.get_num(), 3);
@@ -383,10 +392,18 @@ fn logged_sample_sm_async_lost() -> Result<()> {
         let sm = SampleStateMachine::new(storage.clone());
         let logged = WalFsm::new(sm, LogCtx::memory(&mut mem_log))?;
 
-        check_non_blocking(|| logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: false }));
+        check_non_blocking(|| {
+            logged
+                .apply(SampleOp::AddOne, ApplyOptions { is_sync: false })
+                .unwrap()
+        });
         assert_eq!(logged.get_num(), 2);
 
-        check_non_blocking(|| logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: false }));
+        check_non_blocking(|| {
+            logged
+                .apply(SampleOp::AddOne, ApplyOptions { is_sync: false })
+                .unwrap()
+        });
         assert_eq!(logged.get_num(), 3);
 
         check_non_blocking(|| drop(logged));

@@ -185,6 +185,7 @@ impl Kv for MemKv {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use itertools::Itertools;
 
     #[test]
     fn mem_kv_put_get() {
@@ -242,4 +243,32 @@ mod tests {
     }
 
     // TODO: test range read.
+    #[test]
+    fn mem_kv_range_read() {
+        let kv = MemKv::new();
+
+        kv.put(&WriteOptions::default(), "test1".as_bytes(), "1".as_bytes())
+            .unwrap();
+
+        kv.put(&WriteOptions::default(), "test2".as_bytes(), "2".as_bytes())
+            .unwrap();
+
+        {
+            let range = kv
+                .range(
+                    &ReadOptions::default(),
+                    "test0".as_bytes().to_vec().."test2".as_bytes().to_vec(),
+                )
+                .unwrap();
+
+            let kvps: Vec<Kvp> = range.map(|kvp| kvp.unwrap()).collect_vec();
+            assert_eq!(
+                kvps,
+                vec![Kvp {
+                    key: "test1".as_bytes().to_vec(),
+                    value: "1".as_bytes().to_vec(),
+                },]
+            )
+        }
+    }
 }

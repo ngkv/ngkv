@@ -1,6 +1,6 @@
 mod version_set;
 
-use self::version_set::*;
+pub use version_set::*;
 
 use std::{
     convert::TryFrom,
@@ -12,7 +12,7 @@ use byteorder::{ReadBytesExt, WriteBytesExt};
 use once_cell::sync::OnceCell;
 use wal_fsm::{Fsm, FsmOp, WalFsm};
 
-use crate::{VarintRead, VarintWrite};
+use crate::{Error, Result, VarintRead, VarintWrite};
 
 #[derive(Clone)]
 enum KvOp {
@@ -82,17 +82,18 @@ struct KvFsm {
 
 impl Fsm for KvFsm {
     type Op = KvOp;
+    type E = Error;
 
-    fn init(&self, sink: Box<dyn wal_fsm::ReportSink>) -> wal_fsm::Init {
+    fn init(&self, sink: Box<dyn wal_fsm::ReportSink>) -> Result<wal_fsm::Init> {
         self.sink.set(sink).map_err(|_| ()).expect("already init");
         todo!()
     }
 
-    fn apply(&self, op: Self::Op, lsn: wal_fsm::Lsn) {
+    fn apply(&self, _op: Self::Op, _lsn: wal_fsm::Lsn) -> Result<()> {
         todo!()
     }
 }
 
 pub struct LsmKv {
-    wal_fsm: WalFsm<KvFsm>,
+    _wal_fsm: WalFsm<KvFsm>,
 }
