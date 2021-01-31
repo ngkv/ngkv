@@ -512,11 +512,10 @@ impl VersionSet {
         Ok(())
     }
 
-    /// Get a version handle. When `version_id` is set to `None`, lastest
-    /// version is returned.
-    pub fn get_version(&self, version_id: Option<u32>) -> VersionHandle<'_> {
+    /// Get current version handle.
+    pub fn current(&self) -> VersionHandle<'_> {
         let mut state = self.fsm.shared.state.lock().unwrap();
-        let version_id = version_id.unwrap_or(state.version_id);
+        let version_id = state.version_id;
         state.version_rc_inc(version_id);
 
         let version = state.version_map.get(&version_id).unwrap();
@@ -549,6 +548,14 @@ impl VersionSet {
         self.fsm
             .apply(edit.op, wal_fsm::ApplyOptions { is_sync: true })?;
         Ok(())
+    }
+
+    /// Get all live SST id in ascending order.
+    pub fn live_sst(&self) -> Vec<u32> {
+        let state = self.fsm.shared.state.lock().unwrap();
+        let mut res = state.sst_map.keys().cloned().collect_vec();
+        res.sort();
+        res
     }
 
     // TODO: pick compaction
@@ -587,7 +594,7 @@ mod tests {
 
         {
             let vs = VersionSet::new(temp_dir.path()).unwrap();
-            let version = vs.get_version(None);
+            let version = vs.current();
             let levels = version.levels();
 
             let l0_ssts = levels[0].ssts();
@@ -597,5 +604,44 @@ mod tests {
             assert_eq!(s0.lsn_range(), lsn_range);
             assert_eq!(s0.key_range(), (&*key_range.0, &*key_range.1));
         }
+    }
+
+    #[test]
+    fn version_set_add_del_check_live() {
+        let temp_dir = temp_dir().unwrap();
+
+        let sst_id1;
+        let sst_id2;
+
+        let vs = VersionSet::new(temp_dir.path()).unwrap();
+
+        {
+            sst_id1 = vs.new_sst_id();
+            let lsn_range = (100, 200);
+            let key_range = (vec![10], vec![20]);
+            let edit = VersionEditBuilder::new()
+                .add_sst(sst_id1, 0, lsn_range, key_range.clone())
+                .build();
+            vs.log_and_apply(edit).unwrap();
+        }
+
+        let version = vs.current();
+
+        {
+            sst_id2 = vs.new_sst_id();
+            let lsn_range = (201, 300);
+            let key_range = (vec![10], vec![20]);
+            let edit = VersionEditBuilder::new()
+                .add_sst(sst_id2, 0, lsn_range, key_range.clone())
+                .del_sst(sst_id1)
+                .build();
+            vs.log_and_apply(edit).unwrap();
+        }
+
+        assert_eq!(vs.live_sst(), vec![sst_id1, sst_id2]);
+
+        drop(version);
+
+        assert_eq!(vs.live_sst(), vec![sst_id2]);
     }
 }
