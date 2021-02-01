@@ -5,6 +5,7 @@ mod version_set;
 use std::{
     convert::TryFrom,
     io::{self, Cursor, Read, Write},
+    sync::{Arc, Mutex},
     todo,
 };
 
@@ -12,7 +13,7 @@ use byteorder::{ReadBytesExt, WriteBytesExt};
 use once_cell::sync::OnceCell;
 use wal_fsm::{Fsm, FsmOp, WalFsm};
 
-use crate::{Error, Result, VarintRead, VarintWrite};
+use crate::{Error, Result, Task, TaskCtl, VarintRead, VarintWrite};
 
 #[derive(Clone)]
 enum KvOp {
@@ -76,8 +77,31 @@ impl FsmOp for KvOp {
     }
 }
 
+struct KvFsmState {}
+
+struct KvFsmShared {
+    state: Mutex<KvFsmState>,
+}
+
+struct FlushImmTask {
+    sink: Box<dyn wal_fsm::ReportSink>,
+}
+
+impl Task for FlushImmTask {
+    type Error = Error;
+
+    fn should_run(&mut self) -> crate::ShouldRun {
+        todo!()
+    }
+
+    fn run(&mut self) -> Result<(), Self::Error> {
+        todo!()
+    }
+}
+
 struct KvFsm {
-    sink: OnceCell<Box<dyn wal_fsm::ReportSink>>,
+    shared: Arc<KvFsmShared>,
+    flush_imm_ctl: OnceCell<TaskCtl<FlushImmTask>>
 }
 
 impl Fsm for KvFsm {
@@ -85,11 +109,17 @@ impl Fsm for KvFsm {
     type E = Error;
 
     fn init(&self, sink: Box<dyn wal_fsm::ReportSink>) -> Result<wal_fsm::Init> {
-        self.sink.set(sink).map_err(|_| ()).expect("already init");
+        // TODO:
+        // 1. Initialize version set, read latest SST to get next LSN (for
+        //    recovery).
+        // 2. Initialize imm table flush task.
+        // 3. Initialize compaction task.
         todo!()
     }
 
     fn apply(&self, _op: Self::Op, _lsn: wal_fsm::Lsn) -> Result<()> {
+        // TODO: Write record into mem table. Suspend if mem table is full & imm
+        // table is flushing.
         todo!()
     }
 }
