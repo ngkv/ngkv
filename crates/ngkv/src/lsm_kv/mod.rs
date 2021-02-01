@@ -27,6 +27,13 @@ pub(crate) enum KvOp {
 }
 
 impl KvOp {
+    pub fn key(&self) -> &[u8] {
+        match &self {
+            KvOp::Put { key, .. } => key,
+            KvOp::Delete { key, .. } => key,
+        }
+    }
+
     pub fn serialize_into(&self, mut w: impl Write) -> Result<()> {
         match &self {
             KvOp::Put { key, value } => {
@@ -81,31 +88,17 @@ fn deserialize_buf(mut r: impl Read) -> io::Result<Vec<u8>> {
 }
 
 impl FsmOp for KvFsmOp {
-    fn serialize(&self) -> wal_fsm::Result<Vec<u8>> {
+    type E = Error;
+
+    fn serialize(&self) -> Result<Vec<u8>> {
         let mut cursor = Cursor::new(vec![]);
-        self.op.serialize_into(&mut cursor)?;
+        self.op.serialize_into(&mut cursor).unwrap();
         Ok(cursor.into_inner())
     }
 
-    fn deserialize(buf: &[u8]) -> wal_fsm::Result<Self> {
+    fn deserialize(buf: &[u8]) -> Result<Self> {
         let mut cursor = Cursor::new(buf);
-        let typ = cursor.read_u8()?;
-        match typ {
-            x if x == OpType::Put as u8 => {
-                let key = deserialize_buf(&mut cursor)?;
-                let value = deserialize_buf(&mut cursor)?;
-                Ok(KvFsmOp {
-                    op: KvOp::Put { key, value },
-                })
-            }
-            x if x == OpType::Delete as u8 => {
-                let key = deserialize_buf(&mut cursor)?;
-                Ok(KvFsmOp {
-                    op: KvOp::Delete { key },
-                })
-            }
-            _ => Err(wal_fsm::Error::Corrupted("invalid type".into())),
-        }
+        KvOp::deserialize_from(&mut cursor).map(|op| KvFsmOp { op })
     }
 }
 

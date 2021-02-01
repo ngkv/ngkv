@@ -85,15 +85,17 @@ pub struct TestOp {
 }
 
 impl FsmOp for TestOp {
-    fn serialize(&self) -> Result<Vec<u8>> {
+    type E = Never;
+
+    fn serialize(&self) -> Result<Vec<u8>, Never> {
         let mut buf = vec![];
         buf.write_u64::<LittleEndian>(self.no).unwrap();
         Ok(buf)
     }
 
-    fn deserialize(mut buf: &[u8]) -> Result<Self> {
+    fn deserialize(mut buf: &[u8]) -> Result<Self, Never> {
         assert!(buf.len() == 8);
-        let no = buf.read_u64::<LittleEndian>()?;
+        let no = buf.read_u64::<LittleEndian>().unwrap();
         Ok(TestOp { no })
     }
 }

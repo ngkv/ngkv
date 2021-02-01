@@ -87,14 +87,16 @@ struct VersionOp {
 }
 
 impl FsmOp for VersionOp {
-    fn serialize(&self) -> wal_fsm::Result<Vec<u8>> {
+    type E = Error;
+
+    fn serialize(&self) -> Result<Vec<u8>> {
         Ok(bincode_options().serialize(&self).unwrap())
     }
 
-    fn deserialize(buf: &[u8]) -> wal_fsm::Result<Self> {
+    fn deserialize(buf: &[u8]) -> Result<Self> {
         bincode_options()
             .deserialize(buf)
-            .map_err(|_| wal_fsm::Error::Corrupted("deserialization failed".into()))
+            .map_err(|_| Error::Corrupted("deserialization failed".into()))
     }
 }
 

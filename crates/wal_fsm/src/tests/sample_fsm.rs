@@ -20,11 +20,13 @@ pub enum SampleOp {
 }
 
 impl FsmOp for SampleOp {
-    fn serialize(&self) -> Result<Vec<u8>> {
+    type E = Never;
+
+    fn serialize(&self) -> Result<Vec<u8>, Never> {
         Ok(vec![0xcc])
     }
 
-    fn deserialize(buf: &[u8]) -> Result<Self> {
+    fn deserialize(buf: &[u8]) -> Result<Self, Never> {
         assert!(buf[0] == 0xcc);
         Ok(SampleOp::AddOne)
     }
@@ -308,18 +310,28 @@ fn logged_sample_sm_normal() -> Result<()> {
     let mut mem_log = MemLogStorage::new(Duration::from_secs(0));
     let logged = WalFsm::new(sm, LogCtx::memory(&mut mem_log))?;
 
-    logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: true }).unwrap();
+    logged
+        .apply(SampleOp::AddOne, ApplyOptions { is_sync: true })
+        .unwrap();
     assert_eq!(logged.get_num(), 2);
 
-    logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: true }).unwrap();
+    logged
+        .apply(SampleOp::AddOne, ApplyOptions { is_sync: true })
+        .unwrap();
     assert_eq!(logged.get_num(), 3);
 
     assert_eq!(mem_log.len(), 2);
 
-    logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: false }).unwrap();
-    logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: false }).unwrap();
+    logged
+        .apply(SampleOp::AddOne, ApplyOptions { is_sync: false })
+        .unwrap();
+    logged
+        .apply(SampleOp::AddOne, ApplyOptions { is_sync: false })
+        .unwrap();
 
-    logged.apply(SampleOp::AddOne, ApplyOptions { is_sync: true }).unwrap();
+    logged
+        .apply(SampleOp::AddOne, ApplyOptions { is_sync: true })
+        .unwrap();
     assert_eq!(logged.get_num(), 6);
 
     logged.fire_persist();

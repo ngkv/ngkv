@@ -60,11 +60,6 @@ impl<T> ResultNeverExt<T> for Result<T, Error<Never>> {
     }
 }
 
-pub trait FsmOp: Send + Sync + Sized + 'static {
-    fn serialize(&self) -> Result<Vec<u8>>;
-    fn deserialize(buf: &[u8]) -> Result<Self>;
-}
-
 // Log Sequence Number
 // NOTE: LSN 1 represents the first log
 pub type Lsn = u64;
