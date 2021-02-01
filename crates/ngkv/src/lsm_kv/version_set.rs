@@ -1,12 +1,13 @@
 use crate::{file_log_options, key_comparator, Error, Result, ShouldRun, Task, TaskCtl};
 use bincode::Options;
+use fs::OpenOptions;
 use itertools::Itertools;
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::max,
     collections::{HashMap, HashSet},
-    fs,
+    fs::{self, File},
     io::Write,
     ops::Deref,
     path::{Path, PathBuf},
@@ -74,7 +75,7 @@ struct Version {
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Checkpoint {
-    version_lsn: wal_fsm::Lsn,
+    version_lsn: Lsn,
     ssts: Vec<SstMetaRaw>,
     version_id: u32,
 }
@@ -102,7 +103,7 @@ struct VersionFsmState {
     version_id: u32,
     version_map: HashMap<u32, Version>,
     sst_map: HashMap<u32, SstMeta>,
-    version_lsn: wal_fsm::Lsn,
+    version_lsn: Lsn,
 }
 
 impl VersionFsmState {
@@ -247,6 +248,7 @@ impl VersionFsmState {
 
 struct VersionFsmShared {
     dir: PathBuf,
+    dir_fd: File,
     state: Mutex<VersionFsmState>,
 }
 
@@ -283,6 +285,8 @@ impl Task for CheckpointTask {
         // Atomically set current version file.
         let cur_file_path = current_file_path(&self.fsm_shared.dir);
         fs::rename(&temp_file_path, &cur_file_path)?;
+
+        self.fsm_shared.dir_fd.sync_all()?;
 
         self.sink.report_checkpoint_lsn(version_lsn);
 
@@ -328,7 +332,7 @@ impl Fsm for VersionFsm {
         })
     }
 
-    fn apply(&self, op: Self::Op, lsn: wal_fsm::Lsn) -> Result<(), Self::E> {
+    fn apply(&self, op: Self::Op, lsn: Lsn) -> Result<(), Self::E> {
         let mut state = self.shared.state.lock().unwrap();
 
         // Set of SST id refered by the next version.
@@ -383,7 +387,7 @@ impl SstInfo {
         (&*raw.key_lo, &*raw.key_hi)
     }
 
-    pub fn lsn_range(&self) -> (wal_fsm::Lsn, wal_fsm::Lsn) {
+    pub fn lsn_range(&self) -> (Lsn, Lsn) {
         let raw = self.get_raw();
         (raw.data_lsn_lo, raw.data_lsn_hi)
     }
@@ -492,6 +496,7 @@ impl VersionSet {
                     ckpt_ctl: Default::default(),
                     shared: Arc::new(VersionFsmShared {
                         dir: PathBuf::from(dir),
+                        dir_fd: OpenOptions::new().read(true).open(dir)?,
                         state: Mutex::new(VersionFsmState {
                             sst_map: Default::default(),
                             next_sst_id: 0,
