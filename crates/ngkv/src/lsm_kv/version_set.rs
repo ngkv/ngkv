@@ -563,7 +563,7 @@ mod tests {
     use tempdir::TempDir;
 
     fn temp_dir() -> Result<TempDir> {
-        let dir = TempDir::new("wal_fsm")?;
+        let dir = TempDir::new("version_set")?;
         Ok(dir)
     }
 
