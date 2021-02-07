@@ -1,13 +1,16 @@
-use crate::{file_log_options, key_comparator, Error, Result, ShouldRun, Task, TaskCtl};
+use crate::{
+    file_log_options, key_comparator,
+    lsm_kv::{bincode_options, LEVEL_COUNT},
+    Error, Result, ShouldRun, Task, TaskCtl,
+};
 use bincode::Options;
-use fs::OpenOptions;
 use itertools::Itertools;
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::max,
     collections::{HashMap, HashSet},
-    fs::{self, File},
+    fs,
     io::Write,
     ops::Deref,
     path::{Path, PathBuf},
@@ -18,14 +21,6 @@ use std::{
     time::Duration,
 };
 use wal_fsm::{Fsm, FsmOp, Lsn};
-
-pub const LEVEL_COUNT: u32 = 10;
-
-fn bincode_options() -> impl bincode::Options {
-    bincode::DefaultOptions::new()
-        .with_little_endian()
-        .with_varint_encoding()
-}
 
 fn current_file_path(dir: &Path) -> PathBuf {
     PathBuf::from(dir).join("current")
@@ -250,7 +245,7 @@ impl VersionFsmState {
 
 struct VersionFsmShared {
     dir: PathBuf,
-    dir_fd: File,
+    dir_fd: fs::File,
     state: Mutex<VersionFsmState>,
 }
 
@@ -498,7 +493,7 @@ impl VersionSet {
                     ckpt_ctl: Default::default(),
                     shared: Arc::new(VersionFsmShared {
                         dir: PathBuf::from(dir),
-                        dir_fd: OpenOptions::new().read(true).open(dir)?,
+                        dir_fd: fs::OpenOptions::new().read(true).open(dir)?,
                         state: Mutex::new(VersionFsmState {
                             sst_map: Default::default(),
                             next_sst_id: 0,

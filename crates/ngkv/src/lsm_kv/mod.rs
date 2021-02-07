@@ -3,30 +3,35 @@ mod version_set;
 
 // use version_set::*;
 
-use std::{
-    convert::TryFrom,
-    io::{self, Cursor, Read, Write},
-    sync::{Arc, Mutex},
-    todo,
-};
+use std::{borrow::Cow, convert::TryFrom, io::{self, Cursor, Read, Write}, sync::{Arc, Mutex}, todo};
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
+use bincode::Options;
 use once_cell::sync::OnceCell;
 use wal_fsm::{Fsm, FsmOp, WalFsm};
+use serde::{Serialize, Deserialize};
 
 use crate::{Error, Lsn, Result, ShouldRun, Task, TaskCtl, VarintRead, VarintWrite};
 
-struct KvFsmOp {
-    op: KvOp,
+pub const LEVEL_COUNT: u32 = 10;
+
+fn bincode_options() -> impl bincode::Options {
+    bincode::DefaultOptions::new()
+        .with_little_endian()
+        .with_varint_encoding()
+}
+
+struct KvFsmOp<'a> {
+    op: KvOp<'a>,
 }
 
 #[derive(Clone)]
-pub(crate) enum KvOp {
-    Put { key: Vec<u8>, value: Vec<u8> },
-    Delete { key: Vec<u8> },
+pub(crate) enum KvOp<'a> {
+    Put { key: Cow<'a, [u8]>, value: Cow<'a, [u8]> },
+    Delete { key: Cow<'a, [u8]> },
 }
 
-impl KvOp {
+impl KvOp<'_> {
     pub fn key(&self) -> &[u8] {
         match &self {
             KvOp::Put { key, .. } => key,
@@ -56,7 +61,7 @@ impl KvOp {
             x if x == OpType::Put as u8 => {
                 let key = deserialize_buf(&mut r)?;
                 let value = deserialize_buf(&mut r)?;
-                Ok(KvOp::Put { key, value })
+                Ok(KvOp::Put { key: Cow::Owned(key), value: Cow::Owned(value) })
             }
             x if x == OpType::Delete as u8 => {
                 let key = deserialize_buf(&mut r)?;
