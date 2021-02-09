@@ -8,6 +8,7 @@ edition = "2018"
 
 [dependencies]
 wal_fsm = { path = "../wal_fsm", version = "0.0.0" }
+stdx = { path = "../stdx", version = "0.0.0" }
 itertools = "0.10.0"
 byteorder = "1.4.2"
 crc32fast = "1.2.1"
@@ -22,5 +23,6 @@ chrono = "0.4.19"
 
 [dev-dependencies]
 rand = "0.8.3"
+itertools = "0.10.0"
 tempdir = "0.3.7"
 ctor = "0.1.18"

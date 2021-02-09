@@ -46,7 +46,7 @@ impl<T: Clone> DerefMut for CowArc<T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::CowArc;
+    use super::*;
     use std::ops::Deref;
 
     #[test]

@@ -1,13 +1,12 @@
-mod cow_arc;
 mod lsm_kv;
 #[cfg(test)]
 mod mem_kv;
 mod task_ctl;
-mod varint;
 
 use std::{io, ops::RangeBounds, path::PathBuf, time::Duration};
 
-pub use crate::{cow_arc::*, lsm_kv::*, task_ctl::*, varint::*};
+pub use crate::{lsm_kv::LsmKv, task_ctl::*};
+
 use thiserror::Error;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

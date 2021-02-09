@@ -13,6 +13,13 @@ impl<R: Read> Crc32Read<R> {
         }
     }
 
+    pub fn new_with_initial(inner: R, crc: u32) -> Self {
+        Self {
+            inner,
+            hasher: crc32fast::Hasher::new_with_initial(crc)
+        }
+    }
+
     pub fn finalize(self) -> u32 {
         self.hasher.finalize()
     }
@@ -36,6 +43,13 @@ impl<W: Write> Crc32Write<W> {
         Self {
             inner,
             hasher: crc32fast::Hasher::new(),
+        }
+    }
+
+    pub fn new_with_initial(inner: W, crc: u32) -> Self {
+        Self {
+            inner,
+            hasher: crc32fast::Hasher::new_with_initial(crc)
         }
     }
 

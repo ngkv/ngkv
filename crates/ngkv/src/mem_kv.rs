@@ -5,9 +5,11 @@ use std::{
 };
 
 use crate::{
-    CompareAndSwapStatus, CowArc, Kv, Kvp, RangeIterator, ReadOptions, Result, Snapshot,
+    CompareAndSwapStatus, Kv, Kvp, RangeIterator, ReadOptions, Result, Snapshot,
     WriteOptions,
 };
+
+use stdx::cow_arc::CowArc;
 
 struct MemState {
     tree: CowArc<BTreeMap<Vec<u8>, Vec<u8>>>,

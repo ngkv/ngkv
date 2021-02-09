@@ -1,34 +1,55 @@
+mod bloom;
+mod byte_counter;
+mod serialization;
 mod sst;
 mod version_set;
 
-// use version_set::*;
+use bloom::*;
+use byte_counter::*;
 
-use std::{borrow::Cow, convert::TryFrom, io::{self, Cursor, Read, Write}, sync::{Arc, Mutex}, todo};
+use std::{
+    borrow::Cow,
+    io::Cursor,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    todo,
+};
 
-use byteorder::{ReadBytesExt, WriteBytesExt};
-use bincode::Options;
+use crate::{Error, Lsn, Result, ShouldRun, Task, TaskCtl};
+
 use once_cell::sync::OnceCell;
+use serde::{Deserialize, Serialize};
 use wal_fsm::{Fsm, FsmOp, WalFsm};
-use serde::{Serialize, Deserialize};
 
-use crate::{Error, Lsn, Result, ShouldRun, Task, TaskCtl, VarintRead, VarintWrite};
+pub(crate) const LEVEL_COUNT: u32 = 6;
 
-pub const LEVEL_COUNT: u32 = 10;
 
-fn bincode_options() -> impl bincode::Options {
-    bincode::DefaultOptions::new()
-        .with_little_endian()
-        .with_varint_encoding()
+#[repr(u8)]
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum CompressionType {
+    NoCompression,
+    // TODO: compressed
 }
 
-struct KvFsmOp<'a> {
-    op: KvOp<'a>,
+pub struct Options {
+    pub dir: PathBuf,
+    pub bloom_bits_per_key: u32,
+    pub compression: CompressionType,
 }
 
-#[derive(Clone)]
+struct KvFsmOp {
+    op: KvOp<'static>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) enum KvOp<'a> {
-    Put { key: Cow<'a, [u8]>, value: Cow<'a, [u8]> },
-    Delete { key: Cow<'a, [u8]> },
+    Put {
+        key: Cow<'a, [u8]>,
+        value: Cow<'a, [u8]>,
+    },
+    Delete {
+        key: Cow<'a, [u8]>,
+    },
 }
 
 impl KvOp<'_> {
@@ -39,37 +60,37 @@ impl KvOp<'_> {
         }
     }
 
-    pub fn serialize_into(&self, mut w: impl Write) -> Result<()> {
-        match &self {
-            KvOp::Put { key, value } => {
-                w.write_u8(OpType::Put as u8)?;
-                serialize_buf(&mut w, key)?;
-                serialize_buf(&mut w, value)?;
-            }
-            KvOp::Delete { key } => {
-                w.write_u8(OpType::Delete as u8)?;
-                serialize_buf(&mut w, key)?;
-            }
-        };
+    // pub fn serialize_into(&self, mut w: impl Write) -> Result<()> {
+    //     match &self {
+    //         KvOp::Put { key, value } => {
+    //             w.write_u8(OpType::Put as u8)?;
+    //             serialize_buf(&mut w, key)?;
+    //             serialize_buf(&mut w, value)?;
+    //         }
+    //         KvOp::Delete { key } => {
+    //             w.write_u8(OpType::Delete as u8)?;
+    //             serialize_buf(&mut w, key)?;
+    //         }
+    //     };
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
-    pub fn deserialize_from(mut r: impl Read) -> Result<Self> {
-        let typ = r.read_u8()?;
-        match typ {
-            x if x == OpType::Put as u8 => {
-                let key = deserialize_buf(&mut r)?;
-                let value = deserialize_buf(&mut r)?;
-                Ok(KvOp::Put { key: Cow::Owned(key), value: Cow::Owned(value) })
-            }
-            x if x == OpType::Delete as u8 => {
-                let key = deserialize_buf(&mut r)?;
-                Ok(KvOp::Delete { key })
-            }
-            _ => Err(Error::Corrupted("invalid type".into())),
-        }
-    }
+    // pub fn deserialize_from(mut r: impl Read) -> Result<Self> {
+    //     let typ = r.read_u8()?;
+    //     match typ {
+    //         x if x == OpType::Put as u8 => {
+    //             let key = deserialize_buf(&mut r)?;
+    //             let value = deserialize_buf(&mut r)?;
+    //             Ok(KvOp::Put { key: Cow::Owned(key), value: Cow::Owned(value) })
+    //         }
+    //         x if x == OpType::Delete as u8 => {
+    //             let key = deserialize_buf(&mut r)?;
+    //             Ok(KvOp::Delete { key })
+    //         }
+    //         _ => Err(Error::Corrupted("invalid type".into())),
+    //     }
+    // }
 }
 
 #[repr(u8)]
@@ -78,32 +99,32 @@ enum OpType {
     Delete = 2,
 }
 
-fn serialize_buf(mut w: impl Write, buf: &[u8]) -> io::Result<()> {
-    let len = u32::try_from(buf.len()).expect("buf too large");
-    w.write_var_u32(len)?;
-    w.write_all(buf)?;
-    Ok(())
-}
+// fn serialize_buf(mut w: impl Write, buf: &[u8]) -> io::Result<()> {
+//     let len = u32::try_from(buf.len()).expect("buf too large");
+//     w.write_var_u32(len)?;
+//     w.write_all(buf)?;
+//     Ok(())
+// }
 
-fn deserialize_buf(mut r: impl Read) -> io::Result<Vec<u8>> {
-    let len = r.read_var_u32()?;
-    let mut buf = vec![0u8; len as usize];
-    r.read_exact(&mut buf)?;
-    Ok(buf)
-}
+// fn deserialize_buf(mut r: impl Read) -> io::Result<Vec<u8>> {
+//     let len = r.read_var_u32()?;
+//     let mut buf = vec![0u8; len as usize];
+//     r.read_exact(&mut buf)?;
+//     Ok(buf)
+// }
 
 impl FsmOp for KvFsmOp {
     type E = Error;
 
     fn serialize(&self) -> Result<Vec<u8>> {
-        let mut cursor = Cursor::new(vec![]);
-        self.op.serialize_into(&mut cursor).unwrap();
-        Ok(cursor.into_inner())
+        let mut buf = vec![];
+        serialization::serialize_into(&mut buf, &self.op).unwrap();
+        Ok(buf)
     }
 
     fn deserialize(buf: &[u8]) -> Result<Self> {
-        let mut cursor = Cursor::new(buf);
-        KvOp::deserialize_from(&mut cursor).map(|op| KvFsmOp { op })
+        let op = serialization::deserialize_from(buf).unwrap();
+        Ok(KvFsmOp { op })
     }
 }
 

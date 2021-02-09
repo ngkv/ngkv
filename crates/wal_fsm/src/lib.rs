@@ -1,4 +1,3 @@
-mod crc32_io;
 mod log_ctx;
 mod log_file;
 mod log_mem;

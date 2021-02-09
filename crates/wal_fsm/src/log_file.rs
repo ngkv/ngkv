@@ -12,9 +12,9 @@ use std::{
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use itertools::Itertools;
 use once_cell::sync::OnceCell;
+use stdx::crc32_io::{Crc32Read, Crc32Write};
 
 use crate::{
-    crc32_io::{Crc32Read, Crc32Write},
     Error, LogCtx, LogDiscard, LogRead, LogRecord, LogWrite, LogWriteOptions, Lsn, Never, Result,
 };
 

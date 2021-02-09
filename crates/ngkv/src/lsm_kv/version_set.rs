@@ -1,12 +1,3 @@
-use crate::{
-    file_log_options, key_comparator,
-    lsm_kv::{bincode_options, LEVEL_COUNT},
-    Error, Result, ShouldRun, Task, TaskCtl,
-};
-use bincode::Options;
-use itertools::Itertools;
-use once_cell::sync::OnceCell;
-use serde::{Deserialize, Serialize};
 use std::{
     cmp::max,
     collections::{HashMap, HashSet},
@@ -20,6 +11,16 @@ use std::{
     },
     time::Duration,
 };
+
+use crate::{
+    file_log_options, key_comparator,
+    lsm_kv::{serialization, LEVEL_COUNT},
+    Error, Result, ShouldRun, Task, TaskCtl,
+};
+
+use itertools::Itertools;
+use once_cell::sync::OnceCell;
+use serde::{Deserialize, Serialize};
 use wal_fsm::{Fsm, FsmOp, Lsn};
 
 fn current_file_path(dir: &Path) -> PathBuf {
@@ -85,12 +86,11 @@ impl FsmOp for VersionOp {
     type E = Error;
 
     fn serialize(&self) -> Result<Vec<u8>> {
-        Ok(bincode_options().serialize(&self).unwrap())
+        Ok(serialization::serialize(&self).unwrap())
     }
 
     fn deserialize(buf: &[u8]) -> Result<Self> {
-        bincode_options()
-            .deserialize(buf)
+        serialization::deserialize(buf)
             .map_err(|_| Error::Corrupted("deserialization failed".into()))
     }
 }
@@ -268,7 +268,7 @@ impl Task for CheckpointTask {
         let ckpt = state.checkpoint();
         drop(state);
 
-        let buf = bincode_options().serialize(&ckpt).unwrap();
+        let buf = serialization::serialize(&ckpt).unwrap();
 
         // Write checkpoint into temp file.
         let temp_file_path = temp_file_path(&self.fsm_shared.dir);
@@ -309,7 +309,7 @@ impl Fsm for VersionFsm {
         if cur_file_path.is_file() {
             // Recover from checkpoint.
             let buf = fs::read(&cur_file_path)?;
-            let ckpt: Checkpoint = bincode_options().deserialize(&buf).unwrap();
+            let ckpt: Checkpoint = serialization::deserialize(&buf).unwrap();
             state.recover_checkpoint(ckpt);
         } else {
             // Add default version.
@@ -365,7 +365,7 @@ impl Fsm for VersionFsm {
     }
 }
 
-pub struct SstInfo {
+pub(crate) struct SstInfo {
     raw: *const SstMetaRaw,
 }
 
@@ -398,7 +398,7 @@ struct HandleViewCache {
     levels: Vec<LevelInfo>,
 }
 
-pub struct LevelInfo {
+pub(crate) struct LevelInfo {
     ssts: Vec<SstInfo>,
 }
 
@@ -408,7 +408,7 @@ impl LevelInfo {
     }
 }
 
-pub struct VersionHandle<'a> {
+pub(crate) struct VersionHandle<'a> {
     fsm: &'a VersionFsm,
     version_id: u32,
     view_cache: Arc<HandleViewCache>,
@@ -427,11 +427,11 @@ impl Drop for VersionHandle<'_> {
     }
 }
 
-pub struct Compaction {
+pub(crate) struct Compaction {
     // TODO: compaction info
 }
 
-pub struct VersionEditBuilder {
+pub(crate) struct VersionEditBuilder {
     sst_add: Vec<SstMetaRaw>,
     sst_del: Vec<u32>,
 }
@@ -477,11 +477,11 @@ impl VersionEditBuilder {
     }
 }
 
-pub struct VersionEdit {
+pub(crate) struct VersionEdit {
     op: VersionOp,
 }
 
-pub struct VersionSet {
+pub(crate) struct VersionSet {
     fsm: wal_fsm::WalFsm<VersionFsm>,
 }
 
