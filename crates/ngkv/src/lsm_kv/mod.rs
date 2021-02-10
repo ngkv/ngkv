@@ -10,6 +10,7 @@ use byte_counter::*;
 use std::{
     borrow::Cow,
     io::Cursor,
+    ops::Deref,
     path::PathBuf,
     sync::{Arc, Mutex},
     todo,
@@ -23,7 +24,6 @@ use wal_fsm::{Fsm, FsmOp, WalFsm};
 
 pub(crate) const LEVEL_COUNT: u32 = 6;
 
-
 #[repr(u8)]
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum CompressionType {
@@ -32,9 +32,7 @@ pub enum CompressionType {
 }
 
 // TODO: data block cache
-pub struct DataBlockCache {
-
-}
+pub struct DataBlockCache {}
 
 pub struct Options {
     pub dir: PathBuf,
@@ -48,22 +46,20 @@ struct KvFsmOp {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) enum KvOp<'a> {
-    Put {
-        key: Cow<'a, [u8]>,
-        value: Cow<'a, [u8]>,
-    },
-    Delete {
-        key: Cow<'a, [u8]>,
-    },
+pub(crate) enum ValueOp<'a> {
+    Put { value: Cow<'a, [u8]> },
+    Delete,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct KvOp<'a> {
+    key: Cow<'a, [u8]>,
+    value: ValueOp<'a>,
 }
 
 impl KvOp<'_> {
     pub fn key(&self) -> &[u8] {
-        match &self {
-            KvOp::Put { key, .. } => key,
-            KvOp::Delete { key, .. } => key,
-        }
+        self.key.deref()
     }
 
     // pub fn serialize_into(&self, mut w: impl Write) -> Result<()> {

@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     convert::TryFrom,
     fs,
     io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write},
@@ -14,7 +15,7 @@ use crate::{
     file_log_options, key_comparator,
     lsm_kv::{
         serialization, BloomFilter, BloomFilterBuilder, ByteCountedRead, ByteCountedWrite,
-        CompressionType, KvOp, Options,
+        CompressionType, KvOp, Options, ValueOp,
     },
     Error, Lsn, Result,
 };
@@ -32,10 +33,40 @@ fn sst_path(dir: &Path, id: u32) -> PathBuf {
 }
 
 // Single record.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Clone)]
 pub(crate) struct SstRecord<'a> {
+    key: Cow<'a, [u8]>,
     lsn: Lsn,
-    op: KvOp<'a>,
+    value: ValueOp<'a>,
+}
+
+impl SstRecord<'_> {
+    fn key(&self) -> &[u8] {
+        todo!()
+    }
+
+    fn internal_key(&self) -> InternalKey {
+        todo!()
+    }
+}
+
+// #[derive(Serialize, Deserialize, Default)]
+struct InternalKey<'a>(Cow<'a, [u8]>);
+
+impl<'a> InternalKey<'a> {
+    fn into_short(self) -> ShortInternalKey {
+        ShortInternalKey { buf: self.buf }
+    }
+
+    fn shorten(self, prev: &InternalKey) -> ShortInternalKey {
+        // TODO
+        self.into_short()
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct ShortInternalKey {
+    buf: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -95,7 +126,7 @@ impl serialization::FixedSizeSerializable for Footer {
 #[derive(Serialize, Deserialize, Default)]
 struct IndexBlock {
     data_handles: Vec<BlockHandle>,
-    short_start_keys: Vec<Vec<u8>>,
+    start_keys: Vec<ShortInternalKey>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -222,18 +253,10 @@ impl Sst {
     }
 }
 
-// TODO: shorten the start key.
-fn shorten_start_key<'a>(cur_start: &'a [u8], prev_last: &[u8]) -> &'a [u8] {
-    cur_start
-}
-
 struct DataBlockBuildState {
     written: u32,
     offset: u32,
     filter_builder: BloomFilterBuilder,
-
-    /// Shortened version of the actual start key.
-    short_start_key: Vec<u8>,
 }
 
 struct FileState {
@@ -247,7 +270,7 @@ pub(crate) struct SstWriter {
     index_block: IndexBlock,
     filter_block: FilterBlock,
     cur_data_block: Option<DataBlockBuildState>,
-    prev_data_block_end_key: Option<Vec<u8>>,
+    prev_data_block_end_key: Option<InternalKey>,
     file: FileState,
 }
 
@@ -304,6 +327,8 @@ impl SstWriter {
     fn maybe_finish_data_block(&mut self, force: bool) -> Result<()> {
         if let Some(cur_data_block) = &self.cur_data_block {
             if force || cur_data_block.written >= DATA_BLOCK_SIZE {
+                // TODO: update last key of data block
+
                 // Write data block footer.
                 Self::with_writer(&mut self.file, {
                     let compression = self.opt.compression;
@@ -320,10 +345,9 @@ impl SstWriter {
                     size: cur_data_block.written,
                 };
 
+                // NOTE: index_block.start_keys is pushed earlier (at the time
+                // the data block is started in push()).
                 self.index_block.data_handles.push(handle);
-                self.index_block
-                    .short_start_keys
-                    .push(cur_data_block.short_start_key);
 
                 self.filter_block
                     .blooms
@@ -337,17 +361,20 @@ impl SstWriter {
     pub fn push(&mut self, rec: SstRecord<'_>) -> Result<()> {
         // Start a data block if not present.
         if self.cur_data_block.is_none() {
+            let internal_key = rec.internal_key();
+
             // If there exists a previous data block, we shorten (i.e. removing
             // suffix) the start key of current data block, making it only
             // sufficient to perform indexing.
-            let skey = if let Some(pkey) = self.prev_data_block_end_key.take() {
-                shorten_start_key(rec.op.key(), &pkey)
+            let short_key = if let Some(pkey) = self.prev_data_block_end_key.take() {
+                internal_key.shorten(&pkey)
             } else {
-                rec.op.key()
+                internal_key.into_short()
             };
 
+            self.index_block.start_keys.push(short_key);
+
             self.cur_data_block = Some(DataBlockBuildState {
-                short_start_key: skey.to_owned(),
                 offset: self.file.written,
                 written: 0,
                 filter_builder: BloomFilterBuilder::new(self.opt.bloom_bits_per_key),

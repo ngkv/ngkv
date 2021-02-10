@@ -6,7 +6,7 @@ pub struct Init {
     pub next_lsn: Lsn,
 }
 
-pub trait FsmOp: Send + Sync + Sized + 'static {
+pub trait FsmOp: Send + Sync + Sized {
     type E: StdError;
     fn serialize(&self) -> Result<Vec<u8>, Self::E>;
     fn deserialize(buf: &[u8]) -> Result<Self, Self::E>;
