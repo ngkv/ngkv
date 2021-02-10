@@ -17,6 +17,7 @@ use crate::{
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use chrono::format::InternalFixed;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serialization::{deserialize_from, FixedSizeSerializable};
 use stdx::crc32_io::Crc32Write;
@@ -39,7 +40,7 @@ fn common_prefix_length(v1: &[u8], v2: &[u8]) -> usize {
 
 // Single record.
 // #[derive(Clone)]
-pub(crate) struct SstRecord {
+pub struct SstRecord {
     internal_key: InternalKey,
     value: Vec<u8>,
 }
@@ -163,19 +164,18 @@ struct DataBlockFooter {
     compression: CompressionType,
 
     /// Offset of restart array, relative to the beginning of data block.
-    restart_array_offset: u64,
-
+    restart_array_offset: u32,
     // TODO: checksum?
 }
 
 impl serialization::FixedSizeSerializable for DataBlockFooter {
     fn serialized_size() -> usize {
-        9
+        5
     }
 
     fn serialize_into(&self, mut w: impl Write) -> Result<()> {
         w.write_u8(self.compression as u8)?;
-        w.write_u64::<LittleEndian>(self.restart_array_offset)?;
+        w.write_u32::<LittleEndian>(self.restart_array_offset)?;
         Ok(())
     }
 
@@ -186,7 +186,7 @@ impl serialization::FixedSizeSerializable for DataBlockFooter {
             _ => return Err(Error::Corrupted("invalid compression type".into())),
         };
 
-        let restart_array_offset = r.read_u64::<LittleEndian>()?;
+        let restart_array_offset = r.read_u32::<LittleEndian>()?;
 
         Ok(Self {
             compression,
@@ -195,16 +195,33 @@ impl serialization::FixedSizeSerializable for DataBlockFooter {
     }
 }
 
-pub(crate) struct SstRangeIter<'a> {
+struct DataBlockUncompressed {
+    footer: DataBlockFooter,
+    uncompressed_buf: Vec<u8>
+}
+
+struct RecordPtr {
+    block_idx: u32,
+    in_block_offset: u32,
+}
+
+pub struct SstRangeIter<'a> {
     sst: &'a Sst,
-    start: Bound<&'a [u8]>,
-    end: Bound<&'a [u8]>,
+    start: Bound<InternalKey>,
+    end: Bound<InternalKey>,
+    block: DataBlockUncompressed,
+    start_rec_ptr: Option<RecordPtr>,
+    end_rec_ptr: Option<RecordPtr>
 }
 
 impl Iterator for SstRangeIter<'_> {
     type Item = Result<SstRecord>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.start_rec_ptr.is_none() {
+            // TODO:
+
+        }
         todo!()
     }
 }
@@ -215,7 +232,7 @@ impl DoubleEndedIterator for SstRangeIter<'_> {
     }
 }
 
-pub(crate) struct Sst {
+pub struct Sst {
     opt: Arc<Options>,
     data_cache: Option<Arc<DataBlockCache>>,
     index_block: IndexBlock,
@@ -284,12 +301,12 @@ impl Sst {
 
 struct DataBlockBuildState {
     records_since_restart: u32,
-    bytes_written: u64,
+    bytes_written: u32,
     bytes_offset: u64,
     filter_builder: BloomFilterBuilder,
 
     /// Offset of restart points, relative to the beginning of data block.
-    restart_array: Vec<u64>,
+    restart_array: Vec<u32>,
 }
 
 struct FileState {
@@ -298,7 +315,7 @@ struct FileState {
     bytes_written: u64,
 }
 
-pub(crate) struct SstWriter {
+pub struct SstWriter {
     opt: Arc<Options>,
     index_block: IndexBlock,
     filter_block: FilterBlock,
@@ -381,7 +398,9 @@ impl SstWriter {
                     let restart_array = &cur_data_block.restart_array;
 
                     move |w| {
-                        serialization::serialize_into(&mut *w, restart_array)?;
+                        for &p in restart_array {
+                            w.write_u32::<LittleEndian>(p)?;
+                        }
                         let footer = DataBlockFooter {
                             compression,
                             restart_array_offset,
@@ -390,11 +409,13 @@ impl SstWriter {
                         Ok(())
                     }
                 })?;
-                cur_data_block.bytes_written += written.size;
+
+                assert!(written.size <= u32::MAX as u64);
+                cur_data_block.bytes_written += written.size as u32;
 
                 let handle = BlockHandle {
                     offset: cur_data_block.bytes_offset,
-                    size: cur_data_block.bytes_written,
+                    size: cur_data_block.bytes_written as u64,
                 };
 
                 // NOTE: index_block.start_keys is pushed earlier (at the time
@@ -495,7 +516,12 @@ impl SstWriter {
             }
         })?;
 
-        cur_data_block.bytes_written += handle.size;
+        assert!(handle.size <= u32::MAX as u64);
+        cur_data_block.bytes_written = cur_data_block
+            .bytes_written
+            .checked_add(handle.size as u32)
+            .expect("data block too large");
+
         self.maybe_finish_data_block(false)?;
         Ok(())
     }

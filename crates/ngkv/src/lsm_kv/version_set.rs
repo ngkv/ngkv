@@ -365,7 +365,7 @@ impl Fsm for VersionFsm {
     }
 }
 
-pub(crate) struct SstInfo {
+pub struct SstInfo {
     raw: *const SstMetaRaw,
 }
 
@@ -398,7 +398,7 @@ struct HandleViewCache {
     levels: Vec<LevelInfo>,
 }
 
-pub(crate) struct LevelInfo {
+pub struct LevelInfo {
     ssts: Vec<SstInfo>,
 }
 
@@ -408,7 +408,7 @@ impl LevelInfo {
     }
 }
 
-pub(crate) struct VersionHandle<'a> {
+pub struct VersionHandle<'a> {
     fsm: &'a VersionFsm,
     version_id: u32,
     view_cache: Arc<HandleViewCache>,
@@ -427,11 +427,11 @@ impl Drop for VersionHandle<'_> {
     }
 }
 
-pub(crate) struct Compaction {
+pub struct Compaction {
     // TODO: compaction info
 }
 
-pub(crate) struct VersionEditBuilder {
+pub struct VersionEditBuilder {
     sst_add: Vec<SstMetaRaw>,
     sst_del: Vec<u32>,
 }
@@ -477,11 +477,11 @@ impl VersionEditBuilder {
     }
 }
 
-pub(crate) struct VersionEdit {
+pub struct VersionEdit {
     op: VersionOp,
 }
 
-pub(crate) struct VersionSet {
+pub struct VersionSet {
     fsm: wal_fsm::WalFsm<VersionFsm>,
 }
 

@@ -44,7 +44,7 @@ impl<EFsm: StdError + 'static> From<&str> for Error<EFsm> {
     }
 }
 
-pub(crate) trait ResultNeverExt<T> {
+trait ResultNeverExt<T> {
     fn map_err_never<EFsm: StdError>(self) -> Result<T, Error<EFsm>>;
 }
 

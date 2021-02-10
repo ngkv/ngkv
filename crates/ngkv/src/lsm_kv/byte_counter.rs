@@ -1,6 +1,6 @@
 use std::io::{self, Read, Write};
 
-pub(crate) struct ByteCountedWrite<W> {
+pub struct ByteCountedWrite<W> {
     inner: W,
     count: usize,
 }
@@ -39,7 +39,7 @@ where
     }
 }
 
-pub(crate) struct ByteCountedRead<R> {
+pub struct ByteCountedRead<R> {
     inner: R,
     count: usize,
 }

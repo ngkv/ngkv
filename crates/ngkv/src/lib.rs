@@ -80,11 +80,8 @@ pub trait Kv {
     ) -> Result<Box<dyn '_ + RangeIterator>>;
 }
 
-pub(crate) unsafe fn _override_lifetime<'a, 'b, T>(t: &'a T) -> &'b T {
-    std::mem::transmute(t)
-}
 
-pub(crate) fn file_log_options(dir: PathBuf) -> wal_fsm::FileLogOptions {
+fn file_log_options(dir: PathBuf) -> wal_fsm::FileLogOptions {
     wal_fsm::FileLogOptions {
         dir,
         log_step_size: 1 << 20,    // 1MB
@@ -95,7 +92,7 @@ pub(crate) fn file_log_options(dir: PathBuf) -> wal_fsm::FileLogOptions {
 }
 
 /// Workaround of the `sort_by_key` lifetime issue.
-pub(crate) fn key_comparator<T, K: Ord + ?Sized>(
+fn key_comparator<T, K: Ord + ?Sized>(
     mut f: impl FnMut(&T) -> &K,
 ) -> impl FnMut(&T, &T) -> std::cmp::Ordering {
     move |a, b| f(a).cmp(f(b))

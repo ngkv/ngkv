@@ -22,7 +22,7 @@ use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use wal_fsm::{Fsm, FsmOp, WalFsm};
 
-pub(crate) const LEVEL_COUNT: u32 = 6;
+const LEVEL_COUNT: u32 = 6;
 
 #[repr(u8)]
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -39,7 +39,7 @@ pub struct Options {
     pub bloom_bits_per_key: u32,
     pub compression: CompressionType,
     pub data_block_cache: Option<Arc<DataBlockCache>>,
-    pub data_block_size: u64,
+    pub data_block_size: u32,
     pub data_block_restart_interval: u32,
 }
 
@@ -48,13 +48,13 @@ struct KvFsmOp {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) enum ValueOp<'a> {
+enum ValueOp<'a> {
     Put { value: Cow<'a, [u8]> },
     Delete,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct KvOp<'a> {
+struct KvOp<'a> {
     key: Cow<'a, [u8]>,
     value: ValueOp<'a>,
 }

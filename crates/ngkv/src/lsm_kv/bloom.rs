@@ -2,7 +2,7 @@ use std::todo;
 
 use serde::{de::Visitor, Deserialize, Serialize};
 
-pub(crate) struct BloomFilter {}
+pub struct BloomFilter {}
 
 impl Serialize for BloomFilter {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -54,7 +54,7 @@ impl BloomFilter {
     }
 }
 
-pub(crate) struct BloomFilterBuilder {
+pub struct BloomFilterBuilder {
 
 }
 
