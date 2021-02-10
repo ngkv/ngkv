@@ -1,7 +1,7 @@
 use std::{
     convert::TryFrom,
     fs,
-    io::{BufWriter, Cursor, Write},
+    io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write},
     marker::PhantomData,
     mem,
     path::{Path, PathBuf},
@@ -10,16 +10,18 @@ use std::{
 };
 
 use crate::{
+    file_log_options,
     lsm_kv::{
-        serialization, BloomFilter, BloomFilterBuilder, ByteCounter, CompressionType, KvOp, Options,
+        serialization, BloomFilter, BloomFilterBuilder, ByteCountedRead, ByteCountedWrite,
+        CompressionType, KvOp, Options,
     },
-    Lsn, Result,
+    Error, Lsn, Result,
 };
 
-use byteorder::{LittleEndian, WriteBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use chrono::offset;
-use serde::{Deserialize, Serialize};
-use serialization::FixedSizeSerializable;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serialization::{deserialize_from, FixedSizeSerializable};
 use stdx::crc32_io::Crc32Write;
 
 fn sst_path(dir: &Path, id: u32) -> PathBuf {
@@ -45,8 +47,8 @@ struct BlockHandle {
 // | index_block   | BlockHandle |
 // | filter_block  | BlockHandle |
 // | stat_block    | BlockHandle |
-// | padding:      | [u8]        |
-// | magic:        | u64 (fixed) |
+// | padding       | [u8]        |
+// | magic         | u64 (fixed) |
 // +---------------+-------------+
 // NOTE: padding is used to sizeof(footer) == FOOTER_SIZE.
 
@@ -111,15 +113,22 @@ struct DataBlockFooter {
 
 impl serialization::FixedSizeSerializable for DataBlockFooter {
     fn serialized_size() -> usize {
-        todo!()
+        1
     }
 
-    fn serialize_into(&self, w: impl Write) -> Result<()> {
-        todo!()
+    fn serialize_into(&self, mut w: impl Write) -> Result<()> {
+        w.write_u8(self.compression as u8)?;
+        Ok(())
     }
 
-    fn deserialize_from(r: impl std::io::Read) -> Result<Self> {
-        todo!()
+    fn deserialize_from(mut r: impl std::io::Read) -> Result<Self> {
+        let comp_raw = r.read_u8()?;
+        let compression = match comp_raw {
+            x if x == CompressionType::NoCompression as u8 => CompressionType::NoCompression,
+            _ => return Err(Error::Corrupted("invalid compression type".into())),
+        };
+
+        Ok(Self { compression })
     }
 }
 
@@ -141,11 +150,46 @@ impl DoubleEndedIterator for SstRangeIter<'_> {
     }
 }
 
-pub(crate) struct Sst {}
+pub(crate) struct Sst {
+    index_block: IndexBlock,
+    filter_block: FilterBlock,
+    stat_block: StatBlock,
+    fd: fs::File,
+}
+
+fn read_block<T: DeserializeOwned>(mut r: impl Read + Seek, handle: BlockHandle) -> Result<T> {
+    r.seek(SeekFrom::Start(handle.offset as u64))?;
+    let mut byte_counted = ByteCountedRead::new(&mut r);
+
+    let t = deserialize_from(&mut byte_counted)?;
+    if byte_counted.bytes_read() == handle.size as usize {
+        Ok(t)
+    } else {
+        Err(Error::ReportableBug(
+            "deserializer read unexpected number of bytes".into(),
+        ))
+    }
+}
 
 impl Sst {
-    pub fn open(dir: &Path, id: u32) -> Sst {
-        todo!()
+    pub fn open(dir: &Path, id: u32) -> Result<Sst> {
+        let path = sst_path(dir, id);
+        let mut fd = fs::OpenOptions::new().read(true).open(path)?;
+        let mut reader = BufReader::new(&mut fd);
+
+        reader.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
+        let footer = Footer::deserialize_from(&mut reader)?;
+
+        let index_block = read_block(&mut reader, footer.index_handle)?;
+        let filter_block = read_block(&mut reader, footer.filter_handle)?;
+        let stat_block = read_block(&mut reader, footer.stat_handle)?;
+
+        Ok(Sst {
+            index_block,
+            filter_block,
+            stat_block,
+            fd,
+        })
     }
 
     pub fn get(&self, key: &[u8]) -> Result<SstRecord> {
@@ -225,7 +269,7 @@ impl SstWriter {
         F: FnOnce(&mut dyn Write) -> Result<()>,
     {
         let offset = file.written;
-        let mut byte_counter = ByteCounter::new(&mut file.writer);
+        let mut byte_counter = ByteCountedWrite::new(&mut file.writer);
         f(&mut byte_counter)?;
         let size = u32::try_from(byte_counter.bytes_written()).expect("too large");
         file.written += size;

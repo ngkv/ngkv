@@ -1,18 +1,16 @@
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 
-pub(crate) struct ByteCounter<W> {
+pub(crate) struct ByteCountedWrite<W> {
     inner: W,
     count: usize,
 }
 
-impl<W> ByteCounter<W>
-    where W: Write
+impl<W> ByteCountedWrite<W>
+where
+    W: Write,
 {
     pub fn new(inner: W) -> Self {
-        ByteCounter {
-            inner: inner,
-            count: 0,
-        }
+        Self { inner, count: 0 }
     }
 
     pub fn into_inner(self) -> W {
@@ -24,8 +22,9 @@ impl<W> ByteCounter<W>
     }
 }
 
-impl<W> Write for ByteCounter<W>
-    where W: Write
+impl<W> Write for ByteCountedWrite<W>
+where
+    W: Write,
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let res = self.inner.write(buf);
@@ -37,5 +36,38 @@ impl<W> Write for ByteCounter<W>
 
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
+    }
+}
+
+pub(crate) struct ByteCountedRead<R> {
+    inner: R,
+    count: usize,
+}
+
+impl<R> ByteCountedRead<R>
+where
+    R: Read,
+{
+    pub fn new(inner: R) -> Self {
+        Self { inner, count: 0 }
+    }
+
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+
+    pub fn bytes_read(&self) -> usize {
+        self.count
+    }
+}
+
+impl<R> Read for ByteCountedRead<R>
+where
+    R: Read,
+{
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.count += n;
+        Ok(n)
     }
 }
