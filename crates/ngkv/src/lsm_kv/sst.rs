@@ -1,7 +1,9 @@
 use std::{
+    borrow::Cow,
     cmp::min,
     fs,
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    marker::PhantomData,
     ops::{Bound, Deref, RangeBounds},
     path::{Path, PathBuf},
     sync::Arc,
@@ -20,7 +22,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use chrono::format::InternalFixed;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serialization::{deserialize_from, FixedSizeSerializable};
-use stdx::crc32_io::Crc32Write;
+use stdx::{crc32_io::Crc32Write, parallel_io};
 
 use super::DataBlockCache;
 
@@ -41,14 +43,18 @@ fn common_prefix_length(v1: &[u8], v2: &[u8]) -> usize {
 // Single record.
 // #[derive(Clone)]
 pub struct SstRecord {
-    internal_key: InternalKey,
+    internal_key: InternalKey<'static>,
     value: Vec<u8>,
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone)]
-struct InternalKey(Vec<u8>);
+struct InternalKey<'a>(Cow<'a, [u8]>);
 
-impl InternalKey {
+impl<'a> InternalKey<'a> {
+    fn new(buf: &'a [u8]) -> InternalKey<'a> {
+        Self(Cow::Borrowed(buf))
+    }
+
     fn key(&self) -> &[u8] {
         &self.0[..self.0.len() - 8]
     }
@@ -63,25 +69,25 @@ impl InternalKey {
     }
 
     fn buf_mut(&mut self) -> &mut Vec<u8> {
-        &mut self.0
+        self.0.to_mut()
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 struct ShortInternalKey(Vec<u8>);
 
 impl ShortInternalKey {
-    fn from_internal(ik: &InternalKey) -> Self {
-        Self(ik.0.clone())
-    }
-
     fn new(ik: &InternalKey, prev: Option<&InternalKey>) -> Self {
         // TODO
-        Self(ik.0.clone())
+        Self(ik.buf().to_owned())
+    }
+
+    fn buf(&self) -> &[u8] {
+        self.0.deref()
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Copy, Clone)]
 struct BlockHandle {
     offset: u64,
     size: u64,
@@ -197,9 +203,24 @@ impl serialization::FixedSizeSerializable for DataBlockFooter {
 
 struct DataBlockUncompressed {
     footer: DataBlockFooter,
-    uncompressed_buf: Vec<u8>
+    uncompressed_buf: Vec<u8>,
 }
 
+// TODO: make it a smart pointer, allowing cached block get.
+struct DataBlockUncompressedHandle<'a> {
+    data: DataBlockUncompressed,
+    _t: PhantomData<&'a ()>,
+}
+
+impl Deref for DataBlockUncompressedHandle<'_> {
+    type Target = DataBlockUncompressed;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+#[derive(Clone, Copy)]
 struct RecordPtr {
     block_idx: u32,
     in_block_offset: u32,
@@ -207,11 +228,11 @@ struct RecordPtr {
 
 pub struct SstRangeIter<'a> {
     sst: &'a Sst,
-    start: Bound<InternalKey>,
-    end: Bound<InternalKey>,
+    start: Bound<InternalKey<'a>>,
+    end: Bound<InternalKey<'a>>,
     block: DataBlockUncompressed,
     start_rec_ptr: Option<RecordPtr>,
-    end_rec_ptr: Option<RecordPtr>
+    end_rec_ptr: Option<RecordPtr>,
 }
 
 impl Iterator for SstRangeIter<'_> {
@@ -219,10 +240,16 @@ impl Iterator for SstRangeIter<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.start_rec_ptr.is_none() {
-            // TODO:
-
+            self.start_rec_ptr = self.sst.seek_forward(&self.start);
         }
-        todo!()
+
+        let start_rec_ptr = self.start_rec_ptr?;
+        match self.sst.data_block(start_rec_ptr.block_idx) {
+            Ok(data_block) => {
+                todo!()
+            }
+            Err(e) => Some(Err(e)),
+        }
     }
 }
 
@@ -281,21 +308,73 @@ impl Sst {
         })
     }
 
+    /// Seek to the first record which satisfies start bound constraint.
+    fn seek_forward(&self, start: &Bound<InternalKey>) -> Option<RecordPtr> {
+        let mut included = false;
+        let ik = match start {
+            Bound::Included(ik) => {
+                included = true;
+                Some(ik)
+            }
+            Bound::Excluded(ik) => Some(ik),
+            Bound::Unbounded => None,
+        };
+
+        if let Some(ik) = ik {
+            // Find index of last key that is smaller or equal to
+            // current key.
+            let idx = self
+                .index_block
+                .start_keys
+                .binary_search_by_key(&ik.buf(), |sk| sk.buf())
+                .map_or_else(|ins| ins.checked_sub(1).unwrap(), |idx| idx);
+
+            todo!()
+        } else {
+            Some(RecordPtr {
+                block_idx: 0,
+                in_block_offset: 0,
+            })
+        }
+    }
+
+    fn data_block(&self, idx: u32) -> Result<DataBlockUncompressedHandle<'_>> {
+        // TODO: cached read
+        let handle = self.index_block.data_handles[idx as usize];
+        let mut buf = vec![0u8; handle.size as usize];
+        parallel_io::pread_exact(&self.fd, &mut buf, handle.offset)?;
+
+        let footer_start = buf.len() - DataBlockFooter::serialized_size();
+        let footer = DataBlockFooter::deserialize_from(&buf[footer_start..])?;
+
+        buf.resize(footer_start, 0);
+
+        Ok(DataBlockUncompressedHandle {
+            _t: PhantomData::default(),
+            data: DataBlockUncompressed {
+                footer,
+                uncompressed_buf: buf,
+            },
+        })
+    }
+
     pub fn range<'s: 'k, 'k>(
         &'s self,
         range: impl RangeBounds<&'k [u8]>,
     ) -> Result<SstRangeIter<'k>> {
         let map_bound = |b| match b {
-            Bound::Included(&t) => Bound::Included(t),
-            Bound::Excluded(&t) => Bound::Excluded(t),
+            Bound::Included(&t) => Bound::Included(InternalKey::new(t)),
+            Bound::Excluded(&t) => Bound::Excluded(InternalKey::new(t)),
             Bound::Unbounded => Bound::Unbounded,
         };
 
-        Ok(SstRangeIter {
-            sst: self,
-            start: map_bound(range.start_bound()),
-            end: map_bound(range.end_bound()),
-        })
+        // Ok(SstRangeIter {
+        //     sst: self,
+        //     start: map_bound(range.start_bound()),
+        //     end: map_bound(range.end_bound()),
+        // })
+
+        todo!()
     }
 }
 
@@ -320,7 +399,7 @@ pub struct SstWriter {
     index_block: IndexBlock,
     filter_block: FilterBlock,
     cur_data_block: Option<DataBlockBuildState>,
-    prev_key: Option<InternalKey>,
+    prev_key: Option<InternalKey<'static>>,
     file: FileState,
     internal_key_buf: Vec<u8>,
 }
