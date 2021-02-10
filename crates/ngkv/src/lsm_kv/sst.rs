@@ -41,32 +41,52 @@ pub(crate) struct SstRecord<'a> {
 }
 
 impl SstRecord<'_> {
-    fn key(&self) -> &[u8] {
-        todo!()
+    fn internal_key_owned(&self) -> InternalKey<'static> {
+        let mut buf = Vec::with_capacity(self.key.len() + 8);
+        buf.extend_from_slice(self.key.deref());
+        buf.write_u64::<LittleEndian>(self.lsn).unwrap();
+        InternalKey(Cow::Owned(buf))
     }
 
-    fn internal_key(&self) -> InternalKey {
-        todo!()
+    fn internal_key<'a>(&self, buf: &'a mut Vec<u8>) -> InternalKey<'a> {
+        buf.clear();
+        buf.extend_from_slice(self.key.deref());
+        buf.write_u64::<LittleEndian>(self.lsn).unwrap();
+        InternalKey(Cow::Borrowed(buf))
     }
 }
 
-// #[derive(Serialize, Deserialize, Default)]
 struct InternalKey<'a>(Cow<'a, [u8]>);
 
 impl<'a> InternalKey<'a> {
-    fn into_short(self) -> ShortInternalKey {
-        ShortInternalKey { buf: self.buf }
+    fn key(&self) -> &[u8] {
+        let buf = self.0.deref();
+        &buf[..buf.len() - 8]
     }
 
-    fn shorten(self, prev: &InternalKey) -> ShortInternalKey {
-        // TODO
-        self.into_short()
+    fn lsn(&self) -> Lsn {
+        let buf = self.0.deref();
+        let mut slice = &buf[buf.len() - 8..];
+        slice.read_u64::<LittleEndian>().unwrap()
+    }
+
+    fn owned(self) -> InternalKey<'static> {
+        InternalKey(Cow::Owned(self.0.into_owned()))
     }
 }
 
-#[derive(Serialize, Deserialize, Default)]
-struct ShortInternalKey {
-    buf: Vec<u8>,
+#[derive(Serialize, Deserialize)]
+struct ShortInternalKey(Vec<u8>);
+
+impl ShortInternalKey {
+    fn from_internal(ik: &InternalKey<'_>) -> Self {
+        Self(ik.0.deref().to_owned())
+    }
+
+    fn from_internal_shorten(ik: &InternalKey<'_>, prev: &InternalKey) -> Self {
+        // TODO
+        Self(ik.0.deref().to_owned())
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -270,8 +290,9 @@ pub(crate) struct SstWriter {
     index_block: IndexBlock,
     filter_block: FilterBlock,
     cur_data_block: Option<DataBlockBuildState>,
-    prev_data_block_end_key: Option<InternalKey>,
+    prev_data_block_end_key: Option<InternalKey<'static>>,
     file: FileState,
+    internal_key_buf: Vec<u8>,
 }
 
 impl SstWriter {
@@ -289,6 +310,7 @@ impl SstWriter {
             index_block: Default::default(),
             filter_block: Default::default(),
             prev_data_block_end_key: None,
+            internal_key_buf: vec![],
         })
     }
 
@@ -359,17 +381,17 @@ impl SstWriter {
     }
 
     pub fn push(&mut self, rec: SstRecord<'_>) -> Result<()> {
+        let internal_key = rec.internal_key(&mut self.internal_key_buf);
+
         // Start a data block if not present.
         if self.cur_data_block.is_none() {
-            let internal_key = rec.internal_key();
-
             // If there exists a previous data block, we shorten (i.e. removing
             // suffix) the start key of current data block, making it only
             // sufficient to perform indexing.
             let short_key = if let Some(pkey) = self.prev_data_block_end_key.take() {
-                internal_key.shorten(&pkey)
+                ShortInternalKey::from_internal_shorten(&internal_key, &pkey)
             } else {
-                internal_key.into_short()
+                ShortInternalKey::from_internal(&internal_key)
             };
 
             self.index_block.start_keys.push(short_key);
@@ -381,11 +403,13 @@ impl SstWriter {
             });
         }
 
-        let handle = Self::with_writer(&mut self.file, |w| serialization::serialize_into(w, &rec))?;
+        let handle = Self::with_writer(&mut self.file, |w| {
+            todo!()
+        })?;
 
         let cur_data_block = self.cur_data_block.as_mut().unwrap();
         cur_data_block.written += handle.size;
-        cur_data_block.filter_builder.add_key(rec.op.key());
+        cur_data_block.filter_builder.add_key(rec.key.deref());
 
         self.maybe_finish_data_block(false)?;
 
