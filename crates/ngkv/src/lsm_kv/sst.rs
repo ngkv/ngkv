@@ -1,31 +1,25 @@
 use std::{
-    borrow::Cow,
     cmp::min,
-    convert::{TryFrom, TryInto},
     fs,
-    io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write},
-    marker::PhantomData,
-    mem,
-    ops::{Bound, Deref, DerefMut, RangeBounds},
+    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    ops::{Bound, Deref, RangeBounds},
     path::{Path, PathBuf},
     sync::Arc,
     todo,
 };
 
 use crate::{
-    file_log_options, key_comparator,
     lsm_kv::{
         serialization, BloomFilter, BloomFilterBuilder, ByteCountedRead, ByteCountedWrite,
-        CompressionType, KvOp, Options, ValueOp,
+        CompressionType, Options,
     },
     Error, Lsn, Result,
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use chrono::offset;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serialization::{deserialize_from, serialize_into, FixedSizeSerializable};
-use stdx::{crc32_io::Crc32Write, varint_io::VarintWrite};
+use serialization::{deserialize_from, FixedSizeSerializable};
+use stdx::crc32_io::Crc32Write;
 
 use super::DataBlockCache;
 
@@ -33,8 +27,14 @@ fn sst_path(dir: &Path, id: u32) -> PathBuf {
     PathBuf::from(dir).join(format!("sst-{}", id))
 }
 
-fn sz_32(sz: usize) -> u32 {
-    sz.try_into().unwrap()
+fn common_prefix_length(v1: &[u8], v2: &[u8]) -> usize {
+    let min_len = min(v1.len(), v2.len());
+    for i in 0..min_len {
+        if v1[i] != v2[i] {
+            return i;
+        }
+    }
+    return min_len;
 }
 
 // Single record.
@@ -42,22 +42,6 @@ fn sz_32(sz: usize) -> u32 {
 pub(crate) struct SstRecord {
     internal_key: InternalKey,
     value: Vec<u8>,
-}
-
-impl SstRecord {
-    // fn internal_key_owned(&self) -> InternalKey<'static> {
-    //     let mut buf = Vec::with_capacity(self.key.len() + 8);
-    //     buf.extend_from_slice(self.key.deref());
-    //     buf.write_u64::<LittleEndian>(self.lsn).unwrap();
-    //     InternalKey(Cow::Owned(buf))
-    // }
-
-    // fn internal_key<'a>(&self, buf: &'a mut Vec<u8>) -> InternalKey<'a> {
-    //     buf.clear();
-    //     buf.extend_from_slice(self.key.deref());
-    //     buf.write_u64::<LittleEndian>(self.lsn).unwrap();
-    //     InternalKey(Cow::Borrowed(buf))
-    // }
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone)]
@@ -98,8 +82,17 @@ impl ShortInternalKey {
 
 #[derive(Serialize, Deserialize)]
 struct BlockHandle {
-    offset: u32,
-    size: u32,
+    offset: u64,
+    size: u64,
+}
+
+impl BlockHandle {
+    fn from_written(w: Written) -> Self {
+        Self {
+            offset: w.offset,
+            size: w.size,
+        }
+    }
 }
 
 // +---------------+-------------+
@@ -114,10 +107,9 @@ struct BlockHandle {
 // NOTE: padding is used to sizeof(footer) == FOOTER_SIZE.
 
 const FOOTER_MAGIC: u64 = 0xf12345678abcdef;
-const FOOTER_SIZE: u32 = 64;
+const FOOTER_SIZE: u64 = 128;
 
-const DATA_BLOCK_SIZE: u32 = 2048;
-const BLOCK_HANDLE_MAX_SERIALIZED_SIZE: u32 = 10;
+const BLOCK_HANDLE_MAX_SERIALIZED_SIZE: u64 = 10;
 
 struct Footer {
     index_handle: BlockHandle,
@@ -169,16 +161,21 @@ struct StatBlock {
 
 struct DataBlockFooter {
     compression: CompressionType,
+
+    /// Offset of restart array, relative to the beginning of data block.
+    restart_array_offset: u64,
+
     // TODO: checksum?
 }
 
 impl serialization::FixedSizeSerializable for DataBlockFooter {
     fn serialized_size() -> usize {
-        1
+        9
     }
 
     fn serialize_into(&self, mut w: impl Write) -> Result<()> {
         w.write_u8(self.compression as u8)?;
+        w.write_u64::<LittleEndian>(self.restart_array_offset)?;
         Ok(())
     }
 
@@ -189,7 +186,12 @@ impl serialization::FixedSizeSerializable for DataBlockFooter {
             _ => return Err(Error::Corrupted("invalid compression type".into())),
         };
 
-        Ok(Self { compression })
+        let restart_array_offset = r.read_u64::<LittleEndian>()?;
+
+        Ok(Self {
+            compression,
+            restart_array_offset,
+        })
     }
 }
 
@@ -226,7 +228,7 @@ fn read_deser_block<T: DeserializeOwned>(
     mut r: impl Read + Seek,
     handle: BlockHandle,
 ) -> Result<T> {
-    r.seek(SeekFrom::Start(handle.offset as u64))?;
+    r.seek(SeekFrom::Start(handle.offset))?;
     let mut byte_counted = ByteCountedRead::new(&mut r);
 
     let t = deserialize_from(&mut byte_counted)?;
@@ -253,7 +255,7 @@ impl Sst {
         let stat_block = read_deser_block(&mut reader, footer.stat_handle)?;
 
         Ok(Sst {
-            data_cache: opt.data_cache.clone(),
+            data_cache: opt.data_block_cache.clone(),
             opt,
             index_block,
             filter_block,
@@ -282,15 +284,18 @@ impl Sst {
 
 struct DataBlockBuildState {
     records_since_restart: u32,
-    bytes_written: u32,
-    bytes_offset: u32,
+    bytes_written: u64,
+    bytes_offset: u64,
     filter_builder: BloomFilterBuilder,
+
+    /// Offset of restart points, relative to the beginning of data block.
+    restart_array: Vec<u64>,
 }
 
 struct FileState {
     fd: fs::File,
     writer: BufWriter<fs::File>,
-    bytes_written: u32,
+    bytes_written: u64,
 }
 
 pub(crate) struct SstWriter {
@@ -298,20 +303,14 @@ pub(crate) struct SstWriter {
     index_block: IndexBlock,
     filter_block: FilterBlock,
     cur_data_block: Option<DataBlockBuildState>,
-    // prev_data_block_end_key: Option<InternalKey<'static>>,
     prev_key: Option<InternalKey>,
     file: FileState,
     internal_key_buf: Vec<u8>,
 }
 
-fn common_prefix_length(v1: &[u8], v2: &[u8]) -> usize {
-    let min_len = min(v1.len(), v2.len());
-    for i in 0..min_len {
-        if v1[i] != v2[i] {
-            return i;
-        }
-    }
-    return min_len;
+struct Written {
+    size: u64,
+    offset: u64,
 }
 
 impl SstWriter {
@@ -335,7 +334,7 @@ impl SstWriter {
     }
 
     #[inline(always)]
-    fn with_writer_checksum<F>(file: &mut FileState, crc: u32, f: F) -> Result<(u32, BlockHandle)>
+    fn with_writer_checksum<F>(file: &mut FileState, crc: u32, f: F) -> Result<(u32, Written)>
     where
         F: FnOnce(&mut dyn Write) -> Result<()>,
     {
@@ -350,17 +349,17 @@ impl SstWriter {
     }
 
     #[inline(always)]
-    fn with_writer<F>(file: &mut FileState, f: F) -> Result<BlockHandle>
+    fn with_writer<F>(file: &mut FileState, f: F) -> Result<Written>
     where
         F: FnOnce(&mut dyn Write) -> Result<()>,
     {
         let offset = file.bytes_written;
         let mut byte_counter = ByteCountedWrite::new(&mut file.writer);
         f(&mut byte_counter)?;
-        let size = u32::try_from(byte_counter.bytes_written()).expect("too large");
+        let size = byte_counter.bytes_written() as u64;
         file.bytes_written += size;
 
-        Ok(BlockHandle { offset, size })
+        Ok(Written { offset, size })
     }
 
     /// Finish a data block when there exists an active data block, and its size
@@ -368,19 +367,30 @@ impl SstWriter {
     /// size constraint is ignored.
     fn maybe_finish_data_block(&mut self, force: bool) -> Result<()> {
         if let Some(cur_data_block) = &self.cur_data_block {
-            if force || cur_data_block.bytes_written >= DATA_BLOCK_SIZE {
-                // TODO: update last key of data block
+            if force || cur_data_block.bytes_written >= self.opt.data_block_size {
+                let mut cur_data_block = self.cur_data_block.take().unwrap();
 
-                // Write data block footer.
-                Self::with_writer(&mut self.file, {
-                    let compression = self.opt.compression;
+                // Write data block restart array & footer.
+                let written = Self::with_writer(&mut self.file, {
                     // TODO: support compression.
                     // TODO: support checksum.
+                    let compression = self.opt.compression;
                     assert!(compression == CompressionType::NoCompression);
-                    move |w| DataBlockFooter { compression }.serialize_into(w)
-                })?;
 
-                let cur_data_block = self.cur_data_block.take().unwrap();
+                    let restart_array_offset = cur_data_block.bytes_written;
+                    let restart_array = &cur_data_block.restart_array;
+
+                    move |w| {
+                        serialization::serialize_into(&mut *w, restart_array)?;
+                        let footer = DataBlockFooter {
+                            compression,
+                            restart_array_offset,
+                        };
+                        footer.serialize_into(&mut *w)?;
+                        Ok(())
+                    }
+                })?;
+                cur_data_block.bytes_written += written.size;
 
                 let handle = BlockHandle {
                     offset: cur_data_block.bytes_offset,
@@ -413,6 +423,7 @@ impl SstWriter {
             self.cur_data_block = Some(DataBlockBuildState {
                 bytes_offset: self.file.bytes_written,
                 bytes_written: 0,
+                restart_array: vec![],
                 records_since_restart: 0,
                 filter_builder: BloomFilterBuilder::new(self.opt.bloom_bits_per_key),
             });
@@ -431,31 +442,30 @@ impl SstWriter {
         }
 
         let cur_data_block = self.cur_data_block.as_mut().unwrap();
-        if cur_data_block.records_since_restart >= self.opt.block_restart_interval {
+
+        // Add key to bloom filter.
+        cur_data_block
+            .filter_builder
+            .add_key(rec.internal_key.key());
+
+        if cur_data_block.records_since_restart >= self.opt.data_block_restart_interval {
             restart = true;
         }
 
         let ikey_buf = rec.internal_key.buf();
-
-        let ikey_shared_len: u32;
+        let ikey_shared_len: u64;
         let ikey_delta: &[u8];
 
         if restart {
             cur_data_block.records_since_restart = 0;
-
+            // TODO: insert restart point to block footer
             ikey_shared_len = 0;
             ikey_delta = ikey_buf;
-            // TODO: insert restart point to block footer
         } else {
             cur_data_block.records_since_restart += 1;
-
             let prev_key = self.prev_key.as_ref().unwrap();
-            let prefix_len = common_prefix_length(
-                &rec.internal_key.buf(),
-                prev_key.buf(),
-            );
-
-            ikey_shared_len = sz_32(prefix_len);
+            let prefix_len = common_prefix_length(&rec.internal_key.buf(), prev_key.buf());
+            ikey_shared_len = prefix_len as u64;
             ikey_delta = &ikey_buf[prefix_len..];
         }
 
@@ -471,9 +481,9 @@ impl SstWriter {
         // Write current record.
         let handle = Self::with_writer(&mut self.file, {
             let mut ikey_delta = ikey_delta;
-            let ikey_delta_len: u32 = sz_32(ikey_delta.len());
+            let ikey_delta_len: u64 = ikey_delta.len() as u64;
             let mut value = rec.value.deref();
-            let value_len: u32 = sz_32(value.len());
+            let value_len: u64 = value.len() as u64;
 
             move |w| {
                 serialization::serialize_into(&mut *w, &ikey_shared_len)?;
@@ -486,12 +496,7 @@ impl SstWriter {
         })?;
 
         cur_data_block.bytes_written += handle.size;
-        cur_data_block
-            .filter_builder
-            .add_key(rec.internal_key.key());
-
         self.maybe_finish_data_block(false)?;
-
         Ok(())
     }
 
@@ -501,21 +506,21 @@ impl SstWriter {
     pub fn write(mut self) -> Result<()> {
         self.maybe_finish_data_block(true)?;
 
-        let filter_handle = Self::with_writer(&mut self.file, {
+        let filter_handle = BlockHandle::from_written(Self::with_writer(&mut self.file, {
             let blk = &self.filter_block;
             move |w| serialization::serialize_into(w, blk)
-        })?;
+        })?);
 
-        let index_handle = Self::with_writer(&mut self.file, {
+        let index_handle = BlockHandle::from_written(Self::with_writer(&mut self.file, {
             let blk = &self.index_block;
             move |w| serialization::serialize_into(w, blk)
-        })?;
+        })?);
 
-        let stat_handle = {
+        let stat_handle = BlockHandle::from_written({
             // TODO: stat
             let stat = StatBlock {};
             Self::with_writer(&mut self.file, |w| serialization::serialize_into(w, &stat))?
-        };
+        });
 
         // Write footer.
         Self::with_writer(&mut self.file, |w| {

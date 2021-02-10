@@ -38,8 +38,9 @@ pub struct Options {
     pub dir: PathBuf,
     pub bloom_bits_per_key: u32,
     pub compression: CompressionType,
-    pub data_cache: Option<Arc<DataBlockCache>>,
-    pub block_restart_interval: u32,
+    pub data_block_cache: Option<Arc<DataBlockCache>>,
+    pub data_block_size: u64,
+    pub data_block_restart_interval: u32,
 }
 
 struct KvFsmOp {
