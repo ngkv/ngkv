@@ -31,10 +31,16 @@ pub enum CompressionType {
     // TODO: compressed
 }
 
+// TODO: data block cache
+pub struct DataBlockCache {
+
+}
+
 pub struct Options {
     pub dir: PathBuf,
     pub bloom_bits_per_key: u32,
     pub compression: CompressionType,
+    pub data_cache: Option<Arc<DataBlockCache>>,
 }
 
 struct KvFsmOp {

@@ -4,13 +4,14 @@ use std::{
     io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write},
     marker::PhantomData,
     mem,
+    ops::{Bound, Deref, RangeBounds},
     path::{Path, PathBuf},
     sync::Arc,
     todo,
 };
 
 use crate::{
-    file_log_options,
+    file_log_options, key_comparator,
     lsm_kv::{
         serialization, BloomFilter, BloomFilterBuilder, ByteCountedRead, ByteCountedWrite,
         CompressionType, KvOp, Options,
@@ -24,12 +25,14 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serialization::{deserialize_from, FixedSizeSerializable};
 use stdx::crc32_io::Crc32Write;
 
+use super::DataBlockCache;
+
 fn sst_path(dir: &Path, id: u32) -> PathBuf {
     PathBuf::from(dir).join(format!("sst-{}", id))
 }
 
 // Single record.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct SstRecord<'a> {
     lsn: Lsn,
     op: KvOp<'a>,
@@ -133,7 +136,9 @@ impl serialization::FixedSizeSerializable for DataBlockFooter {
 }
 
 pub(crate) struct SstRangeIter<'a> {
-    _a: PhantomData<&'a ()>,
+    sst: &'a Sst,
+    start: Bound<&'a [u8]>,
+    end: Bound<&'a [u8]>,
 }
 
 impl Iterator for SstRangeIter<'_> {
@@ -151,13 +156,18 @@ impl DoubleEndedIterator for SstRangeIter<'_> {
 }
 
 pub(crate) struct Sst {
+    opt: Arc<Options>,
+    data_cache: Option<Arc<DataBlockCache>>,
     index_block: IndexBlock,
     filter_block: FilterBlock,
     stat_block: StatBlock,
     fd: fs::File,
 }
 
-fn read_block<T: DeserializeOwned>(mut r: impl Read + Seek, handle: BlockHandle) -> Result<T> {
+fn read_deser_block<T: DeserializeOwned>(
+    mut r: impl Read + Seek,
+    handle: BlockHandle,
+) -> Result<T> {
     r.seek(SeekFrom::Start(handle.offset as u64))?;
     let mut byte_counted = ByteCountedRead::new(&mut r);
 
@@ -172,19 +182,21 @@ fn read_block<T: DeserializeOwned>(mut r: impl Read + Seek, handle: BlockHandle)
 }
 
 impl Sst {
-    pub fn open(dir: &Path, id: u32) -> Result<Sst> {
-        let path = sst_path(dir, id);
+    pub fn open(opt: Arc<Options>, id: u32) -> Result<Sst> {
+        let path = sst_path(&opt.dir, id);
         let mut fd = fs::OpenOptions::new().read(true).open(path)?;
         let mut reader = BufReader::new(&mut fd);
 
         reader.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
         let footer = Footer::deserialize_from(&mut reader)?;
 
-        let index_block = read_block(&mut reader, footer.index_handle)?;
-        let filter_block = read_block(&mut reader, footer.filter_handle)?;
-        let stat_block = read_block(&mut reader, footer.stat_handle)?;
+        let index_block = read_deser_block(&mut reader, footer.index_handle)?;
+        let filter_block = read_deser_block(&mut reader, footer.filter_handle)?;
+        let stat_block = read_deser_block(&mut reader, footer.stat_handle)?;
 
         Ok(Sst {
+            data_cache: opt.data_cache.clone(),
+            opt,
             index_block,
             filter_block,
             stat_block,
@@ -192,12 +204,21 @@ impl Sst {
         })
     }
 
-    pub fn get(&self, key: &[u8]) -> Result<SstRecord> {
-        todo!()
-    }
+    pub fn range<'s: 'k, 'k>(
+        &'s self,
+        range: impl RangeBounds<&'k [u8]>,
+    ) -> Result<SstRangeIter<'k>> {
+        let map_bound = |b| match b {
+            Bound::Included(&t) => Bound::Included(t),
+            Bound::Excluded(&t) => Bound::Excluded(t),
+            Bound::Unbounded => Bound::Unbounded,
+        };
 
-    pub fn range(&self, key_range: (&[u8], &[u8])) -> Result<SstRangeIter<'_>> {
-        todo!()
+        Ok(SstRangeIter {
+            sst: self,
+            start: map_bound(range.start_bound()),
+            end: map_bound(range.end_bound()),
+        })
     }
 }
 
