@@ -39,6 +39,7 @@ pub struct Options {
     pub bloom_bits_per_key: u32,
     pub compression: CompressionType,
     pub data_cache: Option<Arc<DataBlockCache>>,
+    pub block_restart_interval: u32,
 }
 
 struct KvFsmOp {
