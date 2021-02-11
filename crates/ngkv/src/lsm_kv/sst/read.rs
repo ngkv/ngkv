@@ -65,7 +65,7 @@ impl<'a> BinarySearch for RestartView<'a> {
         let point = self.point_get(idx as u32);
         let delta = self.block.delta_at(point);
         assert_eq!(delta.ikey_shared_len, 0);
-        InternalKey::new(delta.ikey_delta)
+        InternalKey::from_buf(delta.ikey_delta)
     }
 }
 
@@ -372,7 +372,7 @@ impl Sst {
             block_handle: None,
             init: false,
             next_offset: 0,
-            cur_key: InternalKey::new_owned(vec![]),
+            cur_key: InternalKey::from_owned_buf(vec![]),
         })
     }
 
@@ -398,8 +398,8 @@ impl Sst {
 
     fn borrow_key_bound<'k>(b: &'k Bound<InternalKey>) -> Bound<InternalKey<'k>> {
         match b {
-            Bound::Included(ik) => Bound::Included(InternalKey::new(ik.buf())),
-            Bound::Excluded(ik) => Bound::Excluded(InternalKey::new(ik.buf())),
+            Bound::Included(ik) => Bound::Included(InternalKey::from_buf(ik.buf())),
+            Bound::Excluded(ik) => Bound::Excluded(InternalKey::from_buf(ik.buf())),
             Bound::Unbounded => Bound::Unbounded,
         }
     }

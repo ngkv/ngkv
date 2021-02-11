@@ -1,19 +1,14 @@
 mod read;
 mod write;
 
-use read::*;
-use write::*;
+pub use read::*;
+pub use write::*;
 
 use std::{
     borrow::Cow,
-    cmp::min,
-    convert::TryInto,
-    fs,
-    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
-    marker::PhantomData,
-    ops::{Bound, Deref, Index, RangeBounds},
+    io::{self, Write},
+    ops::{Deref},
     path::{Path, PathBuf},
-    sync::Arc,
     todo,
 };
 
@@ -26,16 +21,13 @@ use crate::{
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serialization::{deserialize_from, FixedSizeSerializable};
-use stdx::{binary_search::BinarySearch, bound::BoundExt, crc32_io::Crc32Write, parallel_io};
+use serde::{Deserialize, Serialize};
 
 fn sst_path(dir: &Path, id: u32) -> PathBuf {
     PathBuf::from(dir).join(format!("sst-{}", id))
 }
 
 // Single record.
-// #[derive(Clone)]
 pub struct SstRecord {
     internal_key: InternalKey<'static>,
     value: Vec<u8>,
@@ -45,12 +37,19 @@ pub struct SstRecord {
 pub struct InternalKey<'a>(Cow<'a, [u8]>);
 
 impl<'a> InternalKey<'a> {
-    fn new(buf: &'a [u8]) -> InternalKey<'a> {
+    fn from_buf(buf: &'a [u8]) -> InternalKey<'a> {
         Self(Cow::Borrowed(buf))
     }
 
-    fn new_owned(buf: Vec<u8>) -> InternalKey<'static> {
+    fn from_owned_buf(buf: Vec<u8>) -> InternalKey<'static> {
         InternalKey(Cow::Owned(buf))
+    }
+
+    fn new(key: &[u8], lsn: Lsn) -> InternalKey<'_> {
+        let mut buf = Vec::with_capacity(key.len() + 8);
+        buf.extend_from_slice(key);
+        buf.write_u64::<LittleEndian>(lsn).unwrap();
+        Self::from_owned_buf(buf)
     }
 
     fn apply_delta(&mut self, shared: u32, delta: &[u8]) {
@@ -60,22 +59,18 @@ impl<'a> InternalKey<'a> {
         buf.extend_from_slice(delta);
     }
 
-    fn key(&self) -> &[u8] {
-        &self.0[..self.0.len() - 8]
-    }
-
-    fn lsn(&self) -> Lsn {
-        let mut slice = &self.0[self.0.len() - 8..];
-        slice.read_u64::<LittleEndian>().unwrap()
-    }
-
     fn buf(&self) -> &[u8] {
         &self.0
     }
 
-    // fn buf_mut(&mut self) -> &mut Vec<u8> {
-    //     self.0.to_mut()
-    // }
+    pub fn key(&self) -> &[u8] {
+        &self.0[..self.0.len() - 8]
+    }
+
+    pub fn lsn(&self) -> Lsn {
+        let mut slice = &self.0[self.0.len() - 8..];
+        slice.read_u64::<LittleEndian>().unwrap()
+    }
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
