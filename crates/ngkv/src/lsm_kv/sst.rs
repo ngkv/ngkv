@@ -399,19 +399,16 @@ impl Deref for DataBlockUncompressedHandle<'_> {
     }
 }
 
-struct DataBlockRangeIter<'a> {
+struct BlockIter<'a> {
     block_handle: DataBlockUncompressedHandle<'a>,
-    start: Bound<InternalKey<'a>>,
-    end: Bound<InternalKey<'a>>,
-    forward_init: bool,
-    forward_next_offset: u32,
-    forward_cur_key: InternalKey<'static>,
-    backward_init: bool,
-    backward_next_offset: u32,
-    backward_cur_key: InternalKey<'static>,
+    start_key: Bound<InternalKey<'a>>,
+    end_key: Bound<InternalKey<'a>>,
+    init: bool,
+    next_offset: u32,
+    cur_key: InternalKey<'static>,
 }
 
-impl<'a> Iterator for DataBlockRangeIter<'a> {
+impl<'a> Iterator for BlockIter<'a> {
     type Item = SstRecord;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -419,44 +416,40 @@ impl<'a> Iterator for DataBlockRangeIter<'a> {
 
         let mut bound_check = false;
 
-        if !self.forward_init {
+        if !self.init {
             bound_check = true;
-            self.forward_init = true;
+            self.init = true;
 
-            if let Some(ik_info) = self.start.info() {
+            if let Some(ik_info) = self.start_key.info() {
                 let restart_point = block
                     .prev_restart_point(ik_info.content)
                     .expect("key is not contained by this data block");
 
-                self.forward_next_offset = restart_point;
+                self.next_offset = restart_point;
             }
         }
 
         loop {
-            if self.forward_next_offset >= self.block_handle.footer.restart_array_offset
-                || self.forward_next_offset > self.backward_next_offset
-            {
+            if self.next_offset >= self.block_handle.footer.restart_array_offset {
                 return None;
             }
 
-            let delta = block.delta_at(self.forward_next_offset);
-            self.forward_cur_key
+            let delta = block.delta_at(self.next_offset);
+            self.cur_key
                 .apply_delta(delta.ikey_shared_len, delta.ikey_delta);
-            self.forward_next_offset = delta.next;
+            self.next_offset = delta.next;
 
-            if !bound_check || self.start.is_left_bound_of(&self.forward_cur_key) {
+            if !self.end_key.is_right_bound_of(&self.cur_key) {
+                return None;
+            }
+
+            if !bound_check || self.start_key.is_left_bound_of(&self.cur_key) {
                 return Some(SstRecord {
-                    internal_key: self.forward_cur_key.clone(),
+                    internal_key: self.cur_key.clone(),
                     value: delta.value.to_owned(),
                 });
             }
         }
-    }
-}
-
-impl<'a> DoubleEndedIterator for DataBlockRangeIter<'a> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        todo!()
     }
 }
 
@@ -466,23 +459,32 @@ struct RecordPtr {
     in_block_offset: u32,
 }
 
-struct ForwardIterState<'a> {
-    ptr: RecordPtr,
-    block: DataBlockUncompressedHandle<'a>,
-    cur_key: InternalKey<'static>,
+struct BlockIterWithIdx<'a> {
+    block_idx: u32,
+    iter: BlockIter<'a>,
 }
 
-pub struct SstRangeIter<'a> {
+enum LivingBlockIter<'a> {
+    Seperated {
+        forward: Option<BlockIterWithIdx<'a>>,
+        backward: Option<BlockIterWithIdx<'a>>,
+    },
+    Merged(BlockIterWithIdx<'a>),
+}
+
+pub struct SstIter<'a> {
     sst: &'a Sst,
-    start: Bound<InternalKey<'a>>,
-    end: Bound<InternalKey<'a>>,
-    forward: Option<ForwardIterState<'a>>,
+    start_key: Bound<InternalKey<'a>>,
+    end_key: Bound<InternalKey<'a>>,
+    iter_with_idx: Option<BlockIterWithIdx<'a>>,
+    block_iters: Vec<BlockIter<'a>>,
+    // forward_block_idx: Option<u32>,
+    // backward_block_idx: Option<u32>,
+    // living_block_iter: LivingBlockIter<'a>,
     failed: bool,
-    // start_rec_ptr: Option<RecordPtr>,
-    // end_rec_ptr: Option<RecordPtr>,
 }
 
-impl Iterator for SstRangeIter<'_> {
+impl Iterator for SstIter<'_> {
     type Item = Result<SstRecord>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -490,77 +492,42 @@ impl Iterator for SstRangeIter<'_> {
             return None;
         }
 
-        let mut advance_cur_key = true;
-
-        if self.forward.is_none() {
-            let ptr;
-            let block;
-
-            if let Some(ik_info) = self.start.info() {
-                let block_idx = self.sst.seek_block_forward(&self.start);
-                block = match self.sst.data_block(block_idx) {
-                    Ok(b) => b,
-                    Err(e) => return Some(Err(e)),
+        if self.iter_with_idx.is_none() {
+            let block_idx = self.sst.seek_block_forward(&self.start_key);
+            let iter =
+                match self
+                    .sst
+                    .block_iter(block_idx, self.start_key.clone(), self.end_key.clone())
+                {
+                    Ok(x) => x,
+                    Err(e) => {
+                        self.failed = true;
+                        return Some(Err(e));
+                    }
                 };
-                let restart_point = block
-                    .prev_restart_point(ik_info.content)
-                    .expect("key is not contained by this data block");
 
-                let mut cur_key = InternalKey::new_owned(vec![]);
-                let mut cur_offset = restart_point;
-                while !self.start.is_left_bound_of(&cur_key) {
-                    let delta = block.delta_at(cur_offset);
-                    cur_key.apply_delta(delta.ikey_shared_len, delta.ikey_delta);
-                    cur_offset = delta.next.expect("unexpected end of block");
+            self.iter_with_idx = Some(BlockIterWithIdx { block_idx, iter });
+        }
+
+        let iter_with_idx = self.iter_with_idx.as_mut().unwrap();
+        match iter_with_idx.iter.next() {
+            Some(x) => Some(x),
+            None => {
+                let next_idx = iter_with_idx.block_idx + 1;
+                if next_idx < self.sst.index_block.data_handles.len() as u32 {
+                    self.iter_with_idx = 
+
                 }
 
-                ptr = RecordPtr {
-                    block_idx,
-                    in_block_offset: restart_point,
-                };
-            } else {
-                block = match self.sst.data_block(0) {
-                    Ok(b) => b,
-                    Err(e) => return Some(Err(e)),
-                };
-                ptr = RecordPtr::default();
-
-                let rec = RecordView::from_delta_restart(block.delta_at(0));
+                todo!()
             }
+        };
 
-            self.forward = Some(ForwardIterState {
-                block,
-                ptr,
-                cur_key: InternalKey::new_owned(vec![]),
-            });
-        }
-
-        let forward = self.forward.as_mut().unwrap();
-        while !self.start.is_left_bound_of(&forward.cur_key) {
-            let delta = forward.block.delta_at(forward.ptr.in_block_offset);
-            forward
-                .cur_key
-                .apply_delta(delta.ikey_shared_len, delta.ikey_delta);
-            forward.ptr.in_block_offset = delta.next.expect("unexpected end of block");
-        }
-
-        // let start_block = self.start_block.unwrap();
-        // match self.sst.data_block(start_block) {
-        //     Ok(data_block) => {
-        //         let data_block = data_block.deref();
-
-        //         todo!()
-        //     }
-        //     Err(e) => {
-        //         self.failed = true;
-        //         Some(Err(e))
-        //     }
-        // }
         todo!()
     }
 }
 
-impl DoubleEndedIterator for SstRangeIter<'_> {
+impl DoubleEndedIterator for SstIter<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         todo!()
     }
@@ -615,6 +582,22 @@ impl Sst {
         })
     }
 
+    fn block_iter<'a>(
+        &'a self,
+        block_idx: u32,
+        start: Bound<InternalKey<'a>>,
+        end: Bound<InternalKey<'a>>,
+    ) -> Result<BlockIter<'a>> {
+        Ok(BlockIter {
+            start_key: start,
+            end_key: end,
+            block_handle: self.data_block(block_idx)?,
+            init: false,
+            next_offset: 0,
+            cur_key: InternalKey::new_owned(vec![]),
+        })
+    }
+
     /// Seek to the first data block which might be insteresting.
     fn seek_block_forward(&self, start: &Bound<InternalKey>) -> u32 {
         let mut included = false;
@@ -633,7 +616,7 @@ impl Sst {
             self.index_block
                 .start_keys
                 .binary_search_by_key(&ik.buf(), |sk| sk.buf())
-                .map_or_else(|ins| ins.checked_sub(1).unwrap(), |idx| idx) as u32
+                .map_or_else(|ins| ins.saturating_sub(1), |idx| idx) as u32
         } else {
             0
         }
@@ -659,10 +642,7 @@ impl Sst {
         })
     }
 
-    pub fn range<'s: 'k, 'k>(
-        &'s self,
-        range: impl RangeBounds<&'k [u8]>,
-    ) -> Result<SstRangeIter<'k>> {
+    pub fn range<'s: 'k, 'k>(&'s self, range: impl RangeBounds<&'k [u8]>) -> Result<SstIter<'k>> {
         let map_bound = |b| match b {
             Bound::Included(&t) => Bound::Included(InternalKey::new(t)),
             Bound::Excluded(&t) => Bound::Excluded(InternalKey::new(t)),
