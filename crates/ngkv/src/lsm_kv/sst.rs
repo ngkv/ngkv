@@ -49,20 +49,8 @@ pub struct SstRecord {
     value: Vec<u8>,
 }
 
-#[derive(PartialEq, Eq, Ord, Clone)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub struct InternalKey<'a>(Cow<'a, [u8]>);
-
-impl PartialOrd for InternalKey<'_> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        todo!()
-    }
-}
-
-// impl PartialEq for InternalKey<'_> {
-//     fn eq(&self, other: &Self) -> bool {
-//         self.0.deref().eq(other.0.deref())
-//     }
-// }
 
 impl<'a> InternalKey<'a> {
     fn new(buf: &'a [u8]) -> InternalKey<'a> {
@@ -75,6 +63,7 @@ impl<'a> InternalKey<'a> {
 
     fn apply_delta(&mut self, shared: u32, delta: &[u8]) {
         let buf = self.0.to_mut();
+        assert!(buf.len() as u32 >= shared);
         buf.resize(shared as usize, 0);
         buf.extend_from_slice(delta);
     }
@@ -139,8 +128,6 @@ impl BlockHandle {
 
 const FOOTER_MAGIC: u64 = 0xf12345678abcdef;
 const FOOTER_SIZE: u64 = 128;
-
-const BLOCK_HANDLE_MAX_SERIALIZED_SIZE: u64 = 10;
 
 struct Footer {
     index_handle: BlockHandle,
@@ -230,22 +217,22 @@ struct DataBlockUncompressed {
     uncompressed_buf: Vec<u8>,
 }
 
-struct RecordView<'a> {
-    ikey: InternalKey<'static>,
-    value: &'a [u8],
-    next: u32,
-}
+// struct RecordView<'a> {
+//     ikey: InternalKey<'static>,
+//     value: &'a [u8],
+//     next: u32,
+// }
 
-impl<'a> RecordView<'a> {
-    fn from_delta_restart(delta: RecordDeltaView<'a>) -> Self {
-        assert_eq!(delta.ikey_shared_len, 0, "not a restart point");
-        Self {
-            ikey: InternalKey::new_owned(delta.ikey_delta.to_owned()),
-            value: delta.value,
-            next: delta.next,
-        }
-    }
-}
+// impl<'a> RecordView<'a> {
+//     fn from_delta_restart(delta: RecordDeltaView<'a>) -> Self {
+//         assert_eq!(delta.ikey_shared_len, 0, "not a restart point");
+//         Self {
+//             ikey: InternalKey::new_owned(delta.ikey_delta.to_owned()),
+//             value: delta.value,
+//             next: delta.next,
+//         }
+//     }
+// }
 
 struct RecordDeltaView<'a> {
     ikey_shared_len: u32,
@@ -430,7 +417,6 @@ impl<'a> Iterator for DataBlockIter<'a> {
 
             if let Some(ik_info) = self.start_key.info() {
                 let restart_point = block.prev_restart_point(ik_info.content);
-
                 self.next_offset = restart_point;
             }
         }
@@ -457,25 +443,6 @@ impl<'a> Iterator for DataBlockIter<'a> {
             }
         }
     }
-}
-
-#[derive(Clone, Copy, Default)]
-struct RecordPtr {
-    block_idx: u32,
-    in_block_offset: u32,
-}
-
-struct BlockIterWithIdx<'a> {
-    block_idx: u32,
-    iter: DataBlockIter<'a>,
-}
-
-enum LivingBlockIter<'a> {
-    Seperated {
-        forward: Option<BlockIterWithIdx<'a>>,
-        backward: Option<BlockIterWithIdx<'a>>,
-    },
-    Merged(BlockIterWithIdx<'a>),
 }
 
 // pub struct SstIter<'a> {
@@ -541,24 +508,24 @@ pub struct Sst {
     fd: fs::File,
 }
 
-fn read_deser_block<T: DeserializeOwned>(
-    mut r: impl Read + Seek,
-    handle: BlockHandle,
-) -> Result<T> {
-    r.seek(SeekFrom::Start(handle.offset))?;
-    let mut byte_counted = ByteCountedRead::new(&mut r);
-
-    let t = deserialize_from(&mut byte_counted)?;
-    if byte_counted.bytes_read() == handle.size as usize {
-        Ok(t)
-    } else {
-        Err(Error::ReportableBug(
-            "deserializer read unexpected number of bytes".into(),
-        ))
-    }
-}
-
 impl Sst {
+    fn read_deser_block<T: DeserializeOwned>(
+        mut r: impl Read + Seek,
+        handle: BlockHandle,
+    ) -> Result<T> {
+        r.seek(SeekFrom::Start(handle.offset))?;
+        let mut byte_counted = ByteCountedRead::new(&mut r);
+
+        let t = deserialize_from(&mut byte_counted)?;
+        if byte_counted.bytes_read() == handle.size as usize {
+            Ok(t)
+        } else {
+            Err(Error::ReportableBug(
+                "deserializer read unexpected number of bytes".into(),
+            ))
+        }
+    }
+
     pub fn open(opt: Arc<Options>, id: u32) -> Result<Sst> {
         let path = sst_path(&opt.dir, id);
         let mut fd = fs::OpenOptions::new().read(true).open(path)?;
@@ -567,9 +534,9 @@ impl Sst {
         reader.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
         let footer = Footer::deserialize_from(&mut reader)?;
 
-        let index_block = read_deser_block(&mut reader, footer.index_handle)?;
-        let filter_block = read_deser_block(&mut reader, footer.filter_handle)?;
-        let stat_block = read_deser_block(&mut reader, footer.stat_handle)?;
+        let index_block = Self::read_deser_block(&mut reader, footer.index_handle)?;
+        let filter_block = Self::read_deser_block(&mut reader, footer.filter_handle)?;
+        let stat_block = Self::read_deser_block(&mut reader, footer.stat_handle)?;
 
         Ok(Sst {
             data_cache: opt.data_block_cache.clone(),
@@ -598,30 +565,6 @@ impl Sst {
             cur_key: InternalKey::new_owned(vec![]),
         })
     }
-
-    /// Seek to the first data block which might be insteresting.
-    // fn seek_block_forward(&self, start: &Bound<InternalKey>) -> u32 {
-    //     let mut included = false;
-    //     let ik = match start {
-    //         Bound::Included(ik) => {
-    //             included = true;
-    //             Some(ik)
-    //         }
-    //         Bound::Excluded(ik) => Some(ik),
-    //         Bound::Unbounded => None,
-    //     };
-
-    //     if let Some(ik) = ik {
-    //         // Find index of last key that is smaller or equal to
-    //         // current key.
-    //         self.index_block
-    //             .start_keys
-    //             .binary_search_by_key(&ik.buf(), |sk| sk.buf())
-    //             .map_or_else(|ins| ins.saturating_sub(1), |idx| idx) as u32
-    //     } else {
-    //         0
-    //     }
-    // }
 
     fn data_block_handle(&self, idx: u32) -> Result<DataBlockUncompressedHandle<'_>> {
         // TODO: cached read
