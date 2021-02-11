@@ -197,7 +197,14 @@ impl SstWriter {
         }
     }
 
+    /// Push a record into SST. Records must be pushed in order.
     pub fn push(&mut self, rec: &SstRecord) -> Result<()> {
+        // Check record order.
+        #[cfg(debug_assertions)]
+        if let Some(prev_key) = &self.prev_key {
+            assert!(&rec.internal_key > prev_key, "record out of order");
+        }
+
         let mut restart = false;
 
         if self.maybe_start_data_block(rec) {

@@ -7,16 +7,13 @@ pub use write::*;
 use std::{
     borrow::Cow,
     io::{self, Write},
-    ops::{Deref},
+    ops::Deref,
     path::{Path, PathBuf},
     todo,
 };
 
 use crate::{
-    lsm_kv::{
-        serialization, BloomFilter,
-        CompressionType,
-    },
+    lsm_kv::{serialization, BloomFilter, CompressionType},
     Error, Lsn, Result,
 };
 
@@ -41,7 +38,7 @@ impl<'a> InternalKey<'a> {
         Self(Cow::Borrowed(buf))
     }
 
-    fn from_owned_buf(buf: Vec<u8>) -> InternalKey<'static> {
+    fn from_buf_owned(buf: Vec<u8>) -> InternalKey<'static> {
         InternalKey(Cow::Owned(buf))
     }
 
@@ -49,7 +46,7 @@ impl<'a> InternalKey<'a> {
         let mut buf = Vec::with_capacity(key.len() + 8);
         buf.extend_from_slice(key);
         buf.write_u64::<LittleEndian>(lsn).unwrap();
-        Self::from_owned_buf(buf)
+        Self::from_buf_owned(buf)
     }
 
     fn apply_delta(&mut self, shared: u32, delta: &[u8]) {
@@ -187,5 +184,68 @@ impl serialization::FixedSizeSerializable for DataBlockFooter {
             compression,
             restart_array_offset,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lsm_kv::Options;
+    use std::sync::Arc;
+
+    use tempdir::TempDir;
+
+    fn temp_dir() -> Result<TempDir> {
+        let dir = TempDir::new("sst")?;
+        Ok(dir)
+    }
+
+    #[test]
+    fn internal_key_simple() {
+        let bytes = "Hello".as_bytes();
+        let num = 0xff12345678;
+
+        let ik = InternalKey::new(bytes, num);
+        let buf = ik.buf();
+
+        let ik2 = InternalKey::from_buf(buf);
+        assert_eq!(ik2.lsn(), num);
+        assert_eq!(ik2.key(), bytes);
+    }
+
+    #[test]
+    fn seperator_key_simple() {
+        let ik1 = InternalKey::new("test123456".as_bytes(), 100);
+        let ik2 = InternalKey::new("test1237".as_bytes(), 100);
+        let sk = ShortInternalKey::new(&ik1, Some(&ik2));
+    }
+
+    fn options(dir: &Path) -> Arc<Options> {
+        Arc::new(Options {
+            dir: dir.into(),
+            bloom_bits_per_key: 20,
+            compression: CompressionType::NoCompression,
+            data_block_cache: None,
+            data_block_restart_interval: 16,
+            data_block_size: 4096,
+        })
+    }
+
+    #[test]
+    #[should_panic(expected = "record out of order")]
+    fn writer_out_of_order() {
+        let temp_dir = temp_dir().unwrap();
+        let opt = options(temp_dir.path());
+        let mut w = SstWriter::new(opt, 1).unwrap();
+        w.push(&SstRecord {
+            internal_key: InternalKey::new("hello2".as_bytes(), 3),
+            value: vec![0],
+        })
+        .unwrap();
+        w.push(&SstRecord {
+            internal_key: InternalKey::new("hello1".as_bytes(), 4),
+            value: vec![1],
+        })
+        .unwrap();
     }
 }

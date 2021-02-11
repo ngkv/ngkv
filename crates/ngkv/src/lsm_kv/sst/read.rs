@@ -121,7 +121,7 @@ impl DataBlockUncompressed {
         let restart_array = RestartView::new(&self);
         restart_array
             .binary_search(ik)
-            .map_or_else(|ins| ins, |idx| idx) as u32
+            .map_or_else(|ins| ins.saturating_sub(1), |idx| idx) as u32
     }
 
     // fn record_at(&self, offset: u32) -> RecordView<'_> {
@@ -372,7 +372,7 @@ impl Sst {
             block_handle: None,
             init: false,
             next_offset: 0,
-            cur_key: InternalKey::from_owned_buf(vec![]),
+            cur_key: InternalKey::from_buf_owned(vec![]),
         })
     }
 
@@ -413,7 +413,7 @@ impl Sst {
             self.index_block
                 .start_keys
                 .binary_search_by_key(&ik_info.content.buf(), |sk| sk.buf())
-                .map_or_else(|ins| ins, |idx| idx) as u32
+                .map_or_else(|ins| ins.saturating_sub(1), |idx| idx) as u32
         } else {
             0
         };
@@ -422,7 +422,10 @@ impl Sst {
             self.index_block
                 .start_keys
                 .binary_search_by_key(&ik_info.content.buf(), |sk| sk.buf())
-                .map_or_else(|ins| ins.saturating_sub(1), |idx| idx) as u32
+                .map_or_else(
+                    |ins| ins.checked_sub(1).expect("range is not overlapping"),
+                    |idx| idx,
+                ) as u32
         } else {
             self.index_block.start_keys.len() as u32 - 1
         };
