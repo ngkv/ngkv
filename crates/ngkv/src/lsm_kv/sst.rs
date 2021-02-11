@@ -1,5 +1,4 @@
 use std::{
-    ascii::AsciiExt,
     borrow::Cow,
     cmp::min,
     convert::TryInto,
@@ -20,11 +19,12 @@ use crate::{
     Error, Lsn, Result,
 };
 
+use bincode::config;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use chrono::format::InternalFixed;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serialization::{deserialize_from, FixedSizeSerializable};
-use stdx::{binary_search::BinarySearch, crc32_io::Crc32Write, parallel_io};
+use stdx::{binary_search::BinarySearch, bound::BoundExt, crc32_io::Crc32Write, parallel_io};
 
 use super::DataBlockCache;
 
@@ -49,8 +49,20 @@ pub struct SstRecord {
     value: Vec<u8>,
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Clone)]
+#[derive(PartialEq, Eq, Ord, Clone)]
 struct InternalKey<'a>(Cow<'a, [u8]>);
+
+impl PartialOrd for InternalKey<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        todo!()
+    }
+}
+
+// impl PartialEq for InternalKey<'_> {
+//     fn eq(&self, other: &Self) -> bool {
+//         self.0.deref().eq(other.0.deref())
+//     }
+// }
 
 impl<'a> InternalKey<'a> {
     fn new(buf: &'a [u8]) -> InternalKey<'a> {
@@ -224,6 +236,17 @@ struct RecordView<'a> {
     next: u32,
 }
 
+impl<'a> RecordView<'a> {
+    fn from_delta_restart(delta: RecordDeltaView<'a>) -> Self {
+        assert_eq!(delta.ikey_shared_len, 0, "not a restart point");
+        Self {
+            ikey: InternalKey::new_owned(delta.ikey_delta.to_owned()),
+            value: delta.value,
+            next: delta.next,
+        }
+    }
+}
+
 struct RecordDeltaView<'a> {
     ikey_shared_len: u32,
     ikey_delta: &'a [u8],
@@ -231,36 +254,43 @@ struct RecordDeltaView<'a> {
     next: u32,
 }
 
-struct RestartArrayView<'a> {
-    buf: &'a [u8],
+struct RestartView<'a> {
+    block: &'a DataBlockUncompressed,
 }
 
-impl RestartArrayView<'_> {
-    fn new<'a>(buf: &'a [u8]) -> RestartArrayView<'a> {
-        RestartArrayView { buf }
+impl RestartView<'_> {
+    fn new<'a>(block: &'a DataBlockUncompressed) -> RestartView<'a> {
+        RestartView { block }
     }
 
-    fn get(&self, idx: u32) -> u32 {
+    fn point_buf(&self) -> &[u8] {
+        &self.block.uncompressed_buf[self.block.footer.restart_array_offset as usize..]
+    }
+
+    fn point_count(&self) -> u32 {
+        self.point_buf().len() as u32 / 4
+    }
+
+    fn point_get(&self, idx: u32) -> u32 {
         let mut repr = [0u8; 4];
         let start = (idx * 4) as usize;
-        repr.clone_from_slice(&self.buf[start..start + 4]);
+        repr.clone_from_slice(&self.point_buf()[start..start + 4]);
         u32::from_le_bytes(repr)
-    }
-
-    fn len(&self) -> u32 {
-        self.buf.len() as u32 / 4
     }
 }
 
-impl BinarySearch for RestartArrayView<'_> {
-    type Elem = u32;
+impl<'a> BinarySearch for RestartView<'a> {
+    type Elem = InternalKey<'a>;
 
     fn elem_count(&self) -> usize {
-        self.len() as usize
+        self.point_count() as usize
     }
 
-    fn elem(&self, idx: usize) -> u32 {
-        self.get(idx as u32)
+    fn elem(&self, idx: usize) -> Self::Elem {
+        let point = self.point_get(idx as u32);
+        let delta = self.block.delta_at(point);
+        assert_eq!(delta.ikey_shared_len, 0);
+        InternalKey::new(delta.ikey_delta)
     }
 }
 
@@ -290,69 +320,69 @@ impl DataBlockUncompressed {
         }
     }
 
-    fn prev_restart_point(&self, ik: &InternalKey<'_>) -> u32 {
-        let restart_array = RestartArrayView::new(
-            &self.uncompressed_buf[self.footer.restart_array_offset as usize..],
-        );
-
-        todo!()
+    fn prev_restart_point(&self, ik: &InternalKey<'_>) -> Option<u32> {
+        let restart_array = RestartView::new(&self);
+        restart_array
+            .binary_search(ik)
+            .map_or_else(|ins| ins.checked_sub(1), |idx| Some(idx))
+            .map(|idx| idx as u32)
     }
 
-    fn record_at(&self, offset: u32) -> RecordView<'_> {
-        let restart_array = RestartArrayView::new(
-            &self.uncompressed_buf[self.footer.restart_array_offset as usize..],
-        );
+    // fn record_at(&self, offset: u32) -> RecordView<'_> {
+    //     let restart_array = RestartView::new(
+    //         &self.uncompressed_buf[self.footer.restart_array_offset as usize..],
+    //     );
 
-        // Find first restart point with less or equal offset.
-        let idx = restart_array
-            .binary_search(offset)
-            .map_or_else(|ins| ins.checked_sub(1).unwrap(), |idx| idx) as u32;
+    //     // Find first restart point with less or equal offset.
+    //     let idx = restart_array
+    //         .binary_search(offset)
+    //         .map_or_else(|ins| ins.checked_sub(1).unwrap(), |idx| idx) as u32;
 
-        let restart_point = restart_array.get(idx);
+    //     let restart_point = restart_array.get(idx);
 
-        // Read record at restart point.
-        let delta = self.delta_at(restart_point);
-        assert_eq!(delta.ikey_shared_len, 0);
+    //     // Read record at restart point.
+    //     let delta = self.delta_at(restart_point);
+    //     assert_eq!(delta.ikey_shared_len, 0);
 
-        let mut cur_rec = RecordView {
-            ikey: InternalKey::new_owned(delta.ikey_delta.to_owned()),
-            value: delta.value,
-            next: delta.next,
-        };
-        let mut cur_offset = restart_point;
+    //     let mut cur_rec = RecordView {
+    //         ikey: InternalKey::new_owned(delta.ikey_delta.to_owned()),
+    //         value: delta.value,
+    //         next: delta.next,
+    //     };
+    //     let mut cur_offset = restart_point;
 
-        while cur_offset < offset {
-            // Advance to next record.
-            let (offset, rec) = self
-                .next_record(cur_rec)
-                .expect("unexpected end of records");
-            cur_offset = offset;
-            cur_rec = rec;
-        }
+    //     while cur_offset < offset {
+    //         // Advance to next record.
+    //         let (offset, rec) = self
+    //             .next_record(cur_rec)
+    //             .expect("unexpected end of records");
+    //         cur_offset = offset;
+    //         cur_rec = rec;
+    //     }
 
-        assert_eq!(cur_offset, offset);
+    //     assert_eq!(cur_offset, offset);
 
-        cur_rec
-    }
+    //     cur_rec
+    // }
 
-    fn next_record(&self, cur: RecordView<'_>) -> Option<(u32, RecordView<'_>)> {
-        if cur.next == self.footer.restart_array_offset {
-            None
-        } else {
-            let delta = self.delta_at(cur.next);
-            let mut ikey = cur.ikey;
-            ikey.apply_delta(delta.ikey_shared_len, delta.ikey_delta);
+    // fn next_record(&self, cur: RecordView<'_>) -> Option<(u32, RecordView<'_>)> {
+    //     if cur.next == self.footer.restart_array_offset {
+    //         None
+    //     } else {
+    //         let delta = self.delta_at(cur.next);
+    //         let mut ikey = cur.ikey;
+    //         ikey.apply_delta(delta.ikey_shared_len, delta.ikey_delta);
 
-            Some((
-                cur.next,
-                RecordView {
-                    ikey,
-                    next: delta.next,
-                    value: delta.value,
-                },
-            ))
-        }
-    }
+    //         Some((
+    //             cur.next,
+    //             RecordView {
+    //                 ikey,
+    //                 next: delta.next,
+    //                 value: delta.value,
+    //             },
+    //         ))
+    //     }
+    // }
 }
 
 // TODO: make it a smart pointer, allowing cached block get.
@@ -369,22 +399,84 @@ impl Deref for DataBlockUncompressedHandle<'_> {
     }
 }
 
-#[derive(Clone, Copy)]
+struct DataBlockRangeIter<'a> {
+    block_handle: DataBlockUncompressedHandle<'a>,
+    start: Bound<InternalKey<'a>>,
+    end: Bound<InternalKey<'a>>,
+    forward_init: bool,
+    forward_next_offset: u32,
+    forward_cur_key: InternalKey<'static>,
+    backward_init: bool,
+    backward_next_offset: u32,
+    backward_cur_key: InternalKey<'static>,
+}
+
+impl<'a> Iterator for DataBlockRangeIter<'a> {
+    type Item = SstRecord;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let block = self.block_handle.deref();
+
+        let mut bound_check = false;
+
+        if !self.forward_init {
+            bound_check = true;
+            self.forward_init = true;
+
+            if let Some(ik_info) = self.start.info() {
+                let restart_point = block
+                    .prev_restart_point(ik_info.content)
+                    .expect("key is not contained by this data block");
+
+                self.forward_next_offset = restart_point;
+            }
+        }
+
+        loop {
+            if self.forward_next_offset >= self.block_handle.footer.restart_array_offset
+                || self.forward_next_offset > self.backward_next_offset
+            {
+                return None;
+            }
+
+            let delta = block.delta_at(self.forward_next_offset);
+            self.forward_cur_key
+                .apply_delta(delta.ikey_shared_len, delta.ikey_delta);
+            self.forward_next_offset = delta.next;
+
+            if !bound_check || self.start.is_left_bound_of(&self.forward_cur_key) {
+                return Some(SstRecord {
+                    internal_key: self.forward_cur_key.clone(),
+                    value: delta.value.to_owned(),
+                });
+            }
+        }
+    }
+}
+
+impl<'a> DoubleEndedIterator for DataBlockRangeIter<'a> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        todo!()
+    }
+}
+
+#[derive(Clone, Copy, Default)]
 struct RecordPtr {
     block_idx: u32,
     in_block_offset: u32,
 }
 
-struct ForwardIterState {
+struct ForwardIterState<'a> {
     ptr: RecordPtr,
-    block: DataBlockUncompressed,
+    block: DataBlockUncompressedHandle<'a>,
+    cur_key: InternalKey<'static>,
 }
 
 pub struct SstRangeIter<'a> {
     sst: &'a Sst,
     start: Bound<InternalKey<'a>>,
     end: Bound<InternalKey<'a>>,
-    forward: Option<ForwardIterState>,
+    forward: Option<ForwardIterState<'a>>,
     failed: bool,
     // start_rec_ptr: Option<RecordPtr>,
     // end_rec_ptr: Option<RecordPtr>,
@@ -398,30 +490,73 @@ impl Iterator for SstRangeIter<'_> {
             return None;
         }
 
+        let mut advance_cur_key = true;
+
         if self.forward.is_none() {
-            let block_idx = self.sst.seek_block_forward(&self.start);
-            let data_block = match self.sst.data_block(block_idx) {
-                Ok(b) => b,
-                Err(e) => return Some(Err(e)),
-            };
+            let ptr;
+            let block;
 
-            data_block.record_at(offset)
+            if let Some(ik_info) = self.start.info() {
+                let block_idx = self.sst.seek_block_forward(&self.start);
+                block = match self.sst.data_block(block_idx) {
+                    Ok(b) => b,
+                    Err(e) => return Some(Err(e)),
+                };
+                let restart_point = block
+                    .prev_restart_point(ik_info.content)
+                    .expect("key is not contained by this data block");
 
-            todo!()
+                let mut cur_key = InternalKey::new_owned(vec![]);
+                let mut cur_offset = restart_point;
+                while !self.start.is_left_bound_of(&cur_key) {
+                    let delta = block.delta_at(cur_offset);
+                    cur_key.apply_delta(delta.ikey_shared_len, delta.ikey_delta);
+                    cur_offset = delta.next.expect("unexpected end of block");
+                }
+
+                ptr = RecordPtr {
+                    block_idx,
+                    in_block_offset: restart_point,
+                };
+            } else {
+                block = match self.sst.data_block(0) {
+                    Ok(b) => b,
+                    Err(e) => return Some(Err(e)),
+                };
+                ptr = RecordPtr::default();
+
+                let rec = RecordView::from_delta_restart(block.delta_at(0));
+            }
+
+            self.forward = Some(ForwardIterState {
+                block,
+                ptr,
+                cur_key: InternalKey::new_owned(vec![]),
+            });
         }
 
-        let start_block = self.start_block.unwrap();
-        match self.sst.data_block(start_block) {
-            Ok(data_block) => {
-                let data_block = data_block.deref();
-
-                todo!()
-            }
-            Err(e) => {
-                self.failed = true;
-                Some(Err(e))
-            }
+        let forward = self.forward.as_mut().unwrap();
+        while !self.start.is_left_bound_of(&forward.cur_key) {
+            let delta = forward.block.delta_at(forward.ptr.in_block_offset);
+            forward
+                .cur_key
+                .apply_delta(delta.ikey_shared_len, delta.ikey_delta);
+            forward.ptr.in_block_offset = delta.next.expect("unexpected end of block");
         }
+
+        // let start_block = self.start_block.unwrap();
+        // match self.sst.data_block(start_block) {
+        //     Ok(data_block) => {
+        //         let data_block = data_block.deref();
+
+        //         todo!()
+        //     }
+        //     Err(e) => {
+        //         self.failed = true;
+        //         Some(Err(e))
+        //     }
+        // }
+        todo!()
     }
 }
 
