@@ -1,10 +1,12 @@
 use std::{
+    ascii::AsciiExt,
     borrow::Cow,
     cmp::min,
+    convert::TryInto,
     fs,
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     marker::PhantomData,
-    ops::{Bound, Deref, RangeBounds},
+    ops::{Bound, Deref, Index, RangeBounds},
     path::{Path, PathBuf},
     sync::Arc,
     todo,
@@ -22,7 +24,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use chrono::format::InternalFixed;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serialization::{deserialize_from, FixedSizeSerializable};
-use stdx::{crc32_io::Crc32Write, parallel_io};
+use stdx::{binary_search::BinarySearch, crc32_io::Crc32Write, parallel_io};
 
 use super::DataBlockCache;
 
@@ -55,6 +57,16 @@ impl<'a> InternalKey<'a> {
         Self(Cow::Borrowed(buf))
     }
 
+    fn new_owned(buf: Vec<u8>) -> InternalKey<'static> {
+        InternalKey(Cow::Owned(buf))
+    }
+
+    fn apply_delta(&mut self, shared: u32, delta: &[u8]) {
+        let buf = self.0.to_mut();
+        buf.resize(shared as usize, 0);
+        buf.extend_from_slice(delta);
+    }
+
     fn key(&self) -> &[u8] {
         &self.0[..self.0.len() - 8]
     }
@@ -68,9 +80,9 @@ impl<'a> InternalKey<'a> {
         &self.0
     }
 
-    fn buf_mut(&mut self) -> &mut Vec<u8> {
-        self.0.to_mut()
-    }
+    // fn buf_mut(&mut self) -> &mut Vec<u8> {
+    //     self.0.to_mut()
+    // }
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -206,6 +218,143 @@ struct DataBlockUncompressed {
     uncompressed_buf: Vec<u8>,
 }
 
+struct RecordView<'a> {
+    ikey: InternalKey<'static>,
+    value: &'a [u8],
+    next: u32,
+}
+
+struct RecordDeltaView<'a> {
+    ikey_shared_len: u32,
+    ikey_delta: &'a [u8],
+    value: &'a [u8],
+    next: u32,
+}
+
+struct RestartArrayView<'a> {
+    buf: &'a [u8],
+}
+
+impl RestartArrayView<'_> {
+    fn new<'a>(buf: &'a [u8]) -> RestartArrayView<'a> {
+        RestartArrayView { buf }
+    }
+
+    fn get(&self, idx: u32) -> u32 {
+        let mut repr = [0u8; 4];
+        let start = (idx * 4) as usize;
+        repr.clone_from_slice(&self.buf[start..start + 4]);
+        u32::from_le_bytes(repr)
+    }
+
+    fn len(&self) -> u32 {
+        self.buf.len() as u32 / 4
+    }
+}
+
+impl BinarySearch for RestartArrayView<'_> {
+    type Elem = u32;
+
+    fn elem_count(&self) -> usize {
+        self.len() as usize
+    }
+
+    fn elem(&self, idx: usize) -> u32 {
+        self.get(idx as u32)
+    }
+}
+
+impl DataBlockUncompressed {
+    fn delta_at(&self, offset: u32) -> RecordDeltaView<'_> {
+        assert!(offset < self.footer.restart_array_offset);
+
+        let mut slice =
+            &self.uncompressed_buf[offset as usize..self.footer.restart_array_offset as usize];
+        let len = slice.len();
+
+        let ikey_shared_len: u32 = serialization::deserialize_from(&mut slice).unwrap();
+        let ikey_delta_len: u32 = serialization::deserialize_from(&mut slice).unwrap();
+        let value_len: u32 = serialization::deserialize_from(&mut slice).unwrap();
+
+        let rem = slice;
+        let (ikey_delta, rem) = rem.split_at(ikey_delta_len as usize);
+        let (value, rem) = rem.split_at(value_len as usize);
+
+        let bytes_read = (len - rem.len()) as u32;
+
+        RecordDeltaView {
+            ikey_shared_len,
+            ikey_delta,
+            value,
+            next: offset + bytes_read,
+        }
+    }
+
+    fn prev_restart_point(&self, ik: &InternalKey<'_>) -> u32 {
+        let restart_array = RestartArrayView::new(
+            &self.uncompressed_buf[self.footer.restart_array_offset as usize..],
+        );
+
+        todo!()
+    }
+
+    fn record_at(&self, offset: u32) -> RecordView<'_> {
+        let restart_array = RestartArrayView::new(
+            &self.uncompressed_buf[self.footer.restart_array_offset as usize..],
+        );
+
+        // Find first restart point with less or equal offset.
+        let idx = restart_array
+            .binary_search(offset)
+            .map_or_else(|ins| ins.checked_sub(1).unwrap(), |idx| idx) as u32;
+
+        let restart_point = restart_array.get(idx);
+
+        // Read record at restart point.
+        let delta = self.delta_at(restart_point);
+        assert_eq!(delta.ikey_shared_len, 0);
+
+        let mut cur_rec = RecordView {
+            ikey: InternalKey::new_owned(delta.ikey_delta.to_owned()),
+            value: delta.value,
+            next: delta.next,
+        };
+        let mut cur_offset = restart_point;
+
+        while cur_offset < offset {
+            // Advance to next record.
+            let (offset, rec) = self
+                .next_record(cur_rec)
+                .expect("unexpected end of records");
+            cur_offset = offset;
+            cur_rec = rec;
+        }
+
+        assert_eq!(cur_offset, offset);
+
+        cur_rec
+    }
+
+    fn next_record(&self, cur: RecordView<'_>) -> Option<(u32, RecordView<'_>)> {
+        if cur.next == self.footer.restart_array_offset {
+            None
+        } else {
+            let delta = self.delta_at(cur.next);
+            let mut ikey = cur.ikey;
+            ikey.apply_delta(delta.ikey_shared_len, delta.ikey_delta);
+
+            Some((
+                cur.next,
+                RecordView {
+                    ikey,
+                    next: delta.next,
+                    value: delta.value,
+                },
+            ))
+        }
+    }
+}
+
 // TODO: make it a smart pointer, allowing cached block get.
 struct DataBlockUncompressedHandle<'a> {
     data: DataBlockUncompressed,
@@ -226,29 +375,52 @@ struct RecordPtr {
     in_block_offset: u32,
 }
 
+struct ForwardIterState {
+    ptr: RecordPtr,
+    block: DataBlockUncompressed,
+}
+
 pub struct SstRangeIter<'a> {
     sst: &'a Sst,
     start: Bound<InternalKey<'a>>,
     end: Bound<InternalKey<'a>>,
-    block: DataBlockUncompressed,
-    start_rec_ptr: Option<RecordPtr>,
-    end_rec_ptr: Option<RecordPtr>,
+    forward: Option<ForwardIterState>,
+    failed: bool,
+    // start_rec_ptr: Option<RecordPtr>,
+    // end_rec_ptr: Option<RecordPtr>,
 }
 
 impl Iterator for SstRangeIter<'_> {
     type Item = Result<SstRecord>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.start_rec_ptr.is_none() {
-            self.start_rec_ptr = self.sst.seek_forward(&self.start);
+        if self.failed {
+            return None;
         }
 
-        let start_rec_ptr = self.start_rec_ptr?;
-        match self.sst.data_block(start_rec_ptr.block_idx) {
+        if self.forward.is_none() {
+            let block_idx = self.sst.seek_block_forward(&self.start);
+            let data_block = match self.sst.data_block(block_idx) {
+                Ok(b) => b,
+                Err(e) => return Some(Err(e)),
+            };
+
+            data_block.record_at(offset)
+
+            todo!()
+        }
+
+        let start_block = self.start_block.unwrap();
+        match self.sst.data_block(start_block) {
             Ok(data_block) => {
+                let data_block = data_block.deref();
+
                 todo!()
             }
-            Err(e) => Some(Err(e)),
+            Err(e) => {
+                self.failed = true;
+                Some(Err(e))
+            }
         }
     }
 }
@@ -308,8 +480,8 @@ impl Sst {
         })
     }
 
-    /// Seek to the first record which satisfies start bound constraint.
-    fn seek_forward(&self, start: &Bound<InternalKey>) -> Option<RecordPtr> {
+    /// Seek to the first data block which might be insteresting.
+    fn seek_block_forward(&self, start: &Bound<InternalKey>) -> u32 {
         let mut included = false;
         let ik = match start {
             Bound::Included(ik) => {
@@ -323,18 +495,12 @@ impl Sst {
         if let Some(ik) = ik {
             // Find index of last key that is smaller or equal to
             // current key.
-            let idx = self
-                .index_block
+            self.index_block
                 .start_keys
                 .binary_search_by_key(&ik.buf(), |sk| sk.buf())
-                .map_or_else(|ins| ins.checked_sub(1).unwrap(), |idx| idx);
-
-            todo!()
+                .map_or_else(|ins| ins.checked_sub(1).unwrap(), |idx| idx) as u32
         } else {
-            Some(RecordPtr {
-                block_idx: 0,
-                in_block_offset: 0,
-            })
+            0
         }
     }
 
@@ -553,9 +719,10 @@ impl SstWriter {
         }
 
         let ikey_buf = rec.internal_key.buf();
-        let ikey_shared_len: u64;
+        let ikey_shared_len: u32;
         let ikey_delta: &[u8];
 
+        // Perform common prefix removal.
         if restart {
             cur_data_block.records_since_restart = 0;
             // TODO: insert restart point to block footer
@@ -565,15 +732,13 @@ impl SstWriter {
             cur_data_block.records_since_restart += 1;
             let prev_key = self.prev_key.as_ref().unwrap();
             let prefix_len = common_prefix_length(&rec.internal_key.buf(), prev_key.buf());
-            ikey_shared_len = prefix_len as u64;
+            ikey_shared_len = prefix_len as u32;
             ikey_delta = &ikey_buf[prefix_len..];
         }
 
         // Update prev_key.
         if let Some(prev_key) = &mut self.prev_key {
-            let buf = prev_key.buf_mut();
-            buf.resize(ikey_shared_len as usize, 0);
-            buf.extend_from_slice(ikey_delta);
+            prev_key.apply_delta(ikey_shared_len as u32, ikey_delta);
         } else {
             self.prev_key = Some(rec.internal_key.clone());
         }
@@ -581,9 +746,9 @@ impl SstWriter {
         // Write current record.
         let handle = Self::with_writer(&mut self.file, {
             let mut ikey_delta = ikey_delta;
-            let ikey_delta_len: u64 = ikey_delta.len() as u64;
+            let ikey_delta_len: u32 = ikey_delta.len() as u32;
             let mut value = rec.value.deref();
-            let value_len: u64 = value.len() as u64;
+            let value_len: u32 = value.len() as u32;
 
             move |w| {
                 serialization::serialize_into(&mut *w, &ikey_shared_len)?;
@@ -595,7 +760,6 @@ impl SstWriter {
             }
         })?;
 
-        assert!(handle.size <= u32::MAX as u64);
         cur_data_block.bytes_written = cur_data_block
             .bytes_written
             .checked_add(handle.size as u32)
