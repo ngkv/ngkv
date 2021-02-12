@@ -404,6 +404,21 @@ impl Sst {
         }
     }
 
+    pub fn likely_contains(&self, ikey: InternalKey) -> bool {
+        let idx = self
+            .index_block
+            .start_keys
+            .binary_search_by_key(&ikey.buf(), |sk| sk.buf())
+            .map_or_else(|ins| ins.checked_sub(1), |idx| Some(idx))
+            .map(|idx| idx as u32);
+
+        if let Some(idx) = idx {
+            self.filter_block.blooms[idx as usize].likely_contains(ikey.key())
+        } else {
+            false
+        }
+    }
+
     pub fn range<'a>(
         &'a self,
         start: &'a Bound<InternalKey<'_>>,
