@@ -12,7 +12,7 @@ use std::{
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use itertools::Itertools;
 use once_cell::sync::OnceCell;
-use stdx::crc32_io::{Crc32Read, Crc32Write};
+use stdx::{crc32_io::{Crc32Read, Crc32Write}, io_ext::DirFsync};
 
 use crate::{
     Error, LogCtx, LogDiscard, LogRead, LogRecord, LogWrite, LogWriteOptions, Lsn, Never, Result,
@@ -258,7 +258,7 @@ struct WriteSyncShared {
     options: FileLogOptions,
     cv_has_pending: Condvar,
     cv_writable: Condvar,
-    dir_fd: File,
+    dir_fsync: DirFsync,
     sink: Box<dyn Send + Sync + Fn(Lsn)>,
     state: Mutex<WriteSyncState>,
 }
@@ -371,7 +371,7 @@ impl WriteInner {
         // Sync & notify external world. No race here because we are in the only
         // sync thread.
         sync_fd.sync_all()?;
-        sync.dir_fd.sync_all()?;
+        sync.dir_fsync.fsync()?;
 
         (sync.sink)(sync_lsn);
 
@@ -439,7 +439,7 @@ impl WriteInner {
         };
 
         let shared = Arc::new(WriteSyncShared {
-            dir_fd: OpenOptions::new().read(true).open(&options.dir)?,
+            dir_fsync: DirFsync::new(&options.dir)?,
             options,
             cv_has_pending: Default::default(),
             cv_writable: Default::default(),

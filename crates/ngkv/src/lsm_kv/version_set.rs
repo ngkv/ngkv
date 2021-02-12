@@ -21,6 +21,7 @@ use crate::{
 use itertools::Itertools;
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
+use stdx::io_ext::DirFsync;
 use wal_fsm::{Fsm, FsmOp, Lsn};
 
 fn current_file_path(dir: &Path) -> PathBuf {
@@ -245,7 +246,7 @@ impl VersionFsmState {
 
 struct VersionFsmShared {
     dir: PathBuf,
-    dir_fd: fs::File,
+    dir_fsync: DirFsync,
     state: Mutex<VersionFsmState>,
 }
 
@@ -283,7 +284,7 @@ impl Task for CheckpointTask {
         let cur_file_path = current_file_path(&self.fsm_shared.dir);
         fs::rename(&temp_file_path, &cur_file_path)?;
 
-        self.fsm_shared.dir_fd.sync_all()?;
+        self.fsm_shared.dir_fsync.fsync()?;
 
         self.sink.report_checkpoint_lsn(version_lsn);
 
@@ -493,7 +494,7 @@ impl VersionSet {
                     ckpt_ctl: Default::default(),
                     shared: Arc::new(VersionFsmShared {
                         dir: PathBuf::from(dir),
-                        dir_fd: fs::OpenOptions::new().read(true).open(dir)?,
+                        dir_fsync: DirFsync::new(dir)?,
                         state: Mutex::new(VersionFsmState {
                             sst_map: Default::default(),
                             next_sst_id: 0,

@@ -8,13 +8,13 @@ pub mod bound;
 
 // Ported from sled.
 #[cfg(all(unix, not(miri)))]
-mod parallel_io_unix;
+mod io_ext_unix;
 #[cfg(all(windows, not(miri)))]
-mod parallel_io_windows;
+mod io_ext_windows;
 
-pub mod parallel_io {
+pub mod io_ext {
     #[cfg(all(unix, not(miri)))]
-    pub use crate::parallel_io_unix::*;
+    pub use crate::io_ext_unix::*;
     #[cfg(all(windows, not(miri)))]
-    pub use crate::parallel_io_windows::*;
+    pub use crate::io_ext_windows::*;
 }

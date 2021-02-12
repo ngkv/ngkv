@@ -20,7 +20,7 @@ use crate::{
 
 use serde::de::DeserializeOwned;
 use serialization::{deserialize_from, FixedSizeSerializable};
-use stdx::{binary_search::BinarySearch, bound::BoundExt, parallel_io};
+use stdx::{binary_search::BinarySearch, bound::BoundExt, io_ext};
 
 struct RecordDeltaView<'a> {
     ikey_shared_len: u32,
@@ -380,7 +380,7 @@ impl Sst {
         // TODO: cached read
         let handle = self.index_block.data_handles[idx as usize];
         let mut buf = vec![0u8; handle.size as usize];
-        parallel_io::pread_exact(&self.fd, &mut buf, handle.offset)?;
+        io_ext::pread_exact(&self.fd, &mut buf, handle.offset)?;
 
         let footer_start = buf.len() - DataBlockFooter::serialized_size();
         let footer = DataBlockFooter::deserialize_from(&buf[footer_start..])?;
