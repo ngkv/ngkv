@@ -80,7 +80,6 @@ pub trait Kv {
     ) -> Result<Box<dyn '_ + RangeIterator>>;
 }
 
-
 fn file_log_options(dir: PathBuf) -> wal_fsm::FileLogOptions {
     wal_fsm::FileLogOptions {
         dir,
