@@ -13,66 +13,74 @@ use std::{
 
 use once_cell::sync::OnceCell;
 
-struct Node<V> {
+struct Node<K, V> {
     rc: u32,
+    key: Option<K>,
     value: OnceCell<V>,
     in_lru_list: bool,
-    prev: *mut Node<V>,
-    next: *mut Node<V>,
+    prev: *mut Node<K, V>,
+    next: *mut Node<K, V>,
 }
 
 struct LruState<K, V> {
     capacity: usize,
-    map: HashMap<K, Box<Node<V>>>,
+    map: HashMap<K, Box<Node<K, V>>>,
 
     /// Dummy head node of the circular linked list.
-    dummy: Box<Node<V>>,
+    list_size: usize,
+    list_dummy: Box<Node<K, V>>,
 }
 
 pub struct Lru<K, V> {
     state: Mutex<LruState<K, V>>,
 }
 
-pub struct CacheHandle<'a, K, V> {
+pub struct CacheHandle<'a, K: Hash + Eq + Clone, V> {
     lru: &'a Lru<K, V>,
-    node: *mut Node<V>,
+    node: *mut Node<K, V>,
+}
+
+impl<'a, K: Hash + Eq + Clone, V> CacheHandle<'a, K, V> {
+    pub fn value(&self) -> &V {
+
+    }
+}
+
+impl<'a, K: Hash + Eq + Clone, V> Drop for CacheHandle<'a, K, V> {
+    fn drop(&mut self) {
+        if let Ok(guard) = self.lru.state.lock() {
+            Lru::unref(guard, self.node);
+        }
+    }
 }
 
 impl<K: Hash + Eq + Clone, V> Lru<K, V> {
-    unsafe fn link(cur: *mut Node<V>, next: *mut Node<V>) {
+    unsafe fn link(cur: *mut Node<K, V>, next: *mut Node<K, V>) {
         (*cur).next = next;
         (*next).prev = cur;
     }
 
-    unsafe fn insert_head(dummy: *mut Node<V>, node: *mut Node<V>) {
+    unsafe fn list_insert(dummy: *mut Node<K, V>, node: *mut Node<K, V>) {
         let prev = (*dummy).prev;
         let next = (*dummy).next;
         Self::link(prev, node);
         Self::link(node, next);
     }
 
-    unsafe fn list_remove(node: *mut Node<V>) {
+    unsafe fn list_remove(node: *mut Node<K, V>) {
         let node = &mut *node;
-        assert!(node.in_lru_list);
-        node.in_lru_list = false;
         let prev = node.prev;
         let next = node.next;
         Self::link(prev, next);
-    }
-
-    unsafe fn bring_to_head(dummy: *mut Node<V>, cur: *mut Node<V>) {
-        let prev = (*cur).prev;
-        let next = (*cur).next;
-        Self::link(prev, next);
-        Self::insert_head(dummy, cur);
     }
 
     pub fn new(capacity: usize) -> Self {
         let mut dummy = Box::new(Node {
             prev: null_mut(),
             next: null_mut(),
+            key: None,
             value: OnceCell::new(),
-            in_cache: true,
+            in_lru_list: true,
             rc: 0,
         });
 
@@ -83,15 +91,52 @@ impl<K: Hash + Eq + Clone, V> Lru<K, V> {
             state: Mutex::new(LruState {
                 map: Default::default(),
                 capacity,
-                dummy,
+                list_size: 0,
+                list_dummy: dummy,
             }),
         }
     }
 
-    fn maybe_evict_unused(mut guard: MutexGuard<LruState<K, V>>) {
+    fn maybe_evict(mut guard: MutexGuard<LruState<K, V>>, evict_all: bool) {
+        let mut evict_nodes = vec![];
+
         let state = guard.deref_mut();
-        if state.map.len() > state.capacity {
-            state.dummy
+        let target_size = if evict_all { 0 } else { state.capacity };
+
+        unsafe {
+            while state.list_size > target_size {
+                let oldest_ptr = state.list_dummy.prev;
+                assert!(oldest_ptr != state.list_dummy.as_mut());
+
+                // Remove node from LRU list.
+                let oldest = &mut *oldest_ptr;
+                assert!(oldest.in_lru_list && oldest.rc == 0);
+                state.list_size -= 1;
+                oldest.in_lru_list = false;
+                Self::list_remove(oldest);
+
+                // Remove node from hash map.
+                let node = state.map.remove(oldest.key.as_ref().unwrap()).unwrap();
+                evict_nodes.push(node);
+            }
+        }
+
+        // IMPORTANT: Drop user value without lock held.
+        drop(guard);
+        drop(evict_nodes);
+    }
+
+    fn unref(mut guard: MutexGuard<LruState<K, V>>, node: *mut Node<K, V>) {
+        let state = guard.deref_mut();
+        let node = unsafe { &mut *node };
+        node.rc.checked_sub(1).unwrap();
+        if node.rc == 0 {
+            assert!(!node.in_lru_list);
+            node.in_lru_list = true;
+            unsafe {
+                Self::list_insert(state.list_dummy.as_mut(), node);
+            }
+            Self::maybe_evict(guard, false);
         }
     }
 
@@ -100,24 +145,26 @@ impl<K: Hash + Eq + Clone, V> Lru<K, V> {
         let state = guard.deref_mut();
         let node_ptr = match state.map.entry(key.clone()) {
             Entry::Occupied(mut ent) => unsafe {
-                let node_ptr = ent.get_mut().deref_mut() as *mut Node<V>;
-                Self::bring_to_head(state.dummy.deref_mut(), node_ptr);
-                node_ptr
+                let node = ent.get_mut().deref_mut();
+                node.rc += 1;
+                if node.in_lru_list {
+                    Self::list_remove(node);
+                }
+                node as *mut Node<K, V>
             },
             Entry::Vacant(ent) => {
                 let mut node = Box::new(Node {
                     prev: null_mut(),
+                    key: Some(key.clone()),
                     next: null_mut(),
                     value: OnceCell::new(),
-                    rc: AtomicU32::new(0),
+                    in_lru_list: false,
+                    rc: 1,
                 });
 
-                let node_ptr = node.deref_mut() as *mut Node<V>;
-                unsafe {
-                    Self::insert_head(state.dummy.deref_mut(), node_ptr);
-                }
+                let ptr = node.as_mut() as *mut Node<K, V>;
                 ent.insert(node);
-                node_ptr
+                ptr
             }
         };
 
@@ -125,8 +172,7 @@ impl<K: Hash + Eq + Clone, V> Lru<K, V> {
             // Dereference node_ptr with lock held to avoid breaking the alias
             // rule.
             let value = &(*node_ptr).value;
-            (*node_ptr).rc.fetch_add(1, Ordering::Relaxed);
-            Self::maybe_evict_unused(guard);
+            drop(guard);
 
             // IMPORTANT: Call user-provided init function *without* lock held.
             value.get_or_init(|| init(&key));
