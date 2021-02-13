@@ -145,7 +145,7 @@ mod tests {
             res_set.insert(s);
         }
 
-        res_set.into_iter().collect_vec()
+        res_set.into_iter().sorted().collect_vec()
     }
 
     #[test]
