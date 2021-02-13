@@ -65,7 +65,7 @@ impl ReadDiscardImpl {
 // LOCK ORDER: sync, stor
 struct WriteImpl {
     sync: Arc<SyncShared>,
-    _sync_thread: JoinHandle<()>,
+    sync_thread: Option<JoinHandle<()>>,
     stor: Arc<StorageShared>,
 }
 
@@ -74,8 +74,9 @@ impl Drop for WriteImpl {
         self.sync.killed.store(true, Ordering::Relaxed);
         self.sync.cond.notify_one();
 
-        // Join thread here (by dropping _sync_thread). This ensures that sync
-        // sink would not be called after drop.
+        // Join thread here. This ensures that sync sink would not be called
+        // after drop.
+        self.sync_thread.take().map(|t| t.join().unwrap());
     }
 }
 
@@ -142,7 +143,7 @@ impl WriteImpl {
         Self {
             sync,
             stor,
-            _sync_thread: thread,
+            sync_thread: Some(thread),
         }
     }
 }

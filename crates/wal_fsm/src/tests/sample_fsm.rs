@@ -139,15 +139,18 @@ impl SampleStateMachine {
 
 impl Drop for SampleStateMachine {
     fn drop(&mut self) {
-        let _thread;
         if let Some(mut state) = self.0.try_get_state() {
             state
                 .persister_kill_send
                 .send(())
                 .expect("kill persister failed");
-            _thread = state.persister_thread.take().unwrap();
+
+            let thread = state.persister_thread.take();
+            drop(state);
+
+            // Join thread here, without state mutex held.
+            thread.map(|t| t.join().unwrap());
         }
-        // JoinHandle _thread drops here, without state mutex held.
     }
 }
 
