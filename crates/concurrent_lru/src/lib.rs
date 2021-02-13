@@ -39,12 +39,12 @@ struct Node<K, V> {
 }
 
 struct LruState<K, V> {
-    map: HashMap<K, Box<Node<K, V>>>,
+    map: HashMap<K, NodeBox<K, V>>,
 
     capacity: usize,
 
     /// Dummy head node of the circular linked list. Nodes are in LRU order.
-    list_dummy: Box<Node<K, V>>,
+    list_dummy: NodeBox<K, V>,
 
     // Size of the circular linked list. Dummy head node is excluded. While this
     // is larger than capacity, we perform the eviction.
@@ -108,6 +108,34 @@ where
     }
 }
 
+struct NodeBox<K, V>(*const Node<K, V>);
+
+impl<K, V> NodeBox<K, V> {
+    fn new(node: Node<K, V>) -> Self {
+        Self(Box::into_raw(Box::new(node)))
+    }
+
+    fn as_ptr(&self) -> *const Node<K, V> {
+        self.0
+    }
+}
+
+impl<K, V> Deref for NodeBox<K, V> {
+    type Target = Node<K, V>;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.0 }
+    }
+}
+
+impl<K, V> Drop for NodeBox<K, V> {
+    fn drop(&mut self) {
+        unsafe {
+            Box::from_raw(self.0 as *mut Node<K, V>);
+        }
+    }
+}
+
 impl<K, V> Lru<K, V>
 where
     K: Hash + Eq + Clone,
@@ -120,7 +148,7 @@ where
     /// Append node to list tail (newest).
     unsafe fn list_append(this: &mut LruState<K, V>, node: *const Node<K, V>) {
         this.list_size += 1;
-        let dummy = this.list_dummy.as_ref();
+        let dummy = this.list_dummy.deref();
         let prev = (*dummy.state.get()).prev;
         Self::link(node, dummy);
         Self::link(prev, node);
@@ -143,17 +171,18 @@ where
         unsafe {
             while this.list_size > target_size {
                 // Only obtain a shared reference to the dummy node.
-                let oldest_ptr = (*this.list_dummy.as_ref().state.get()).next;
-                assert!(oldest_ptr != this.list_dummy.as_ref());
+                let oldest_ptr = (*this.list_dummy.state.get()).next;
+                assert!(oldest_ptr != this.list_dummy.deref());
 
-                // Remove node from LRU list.
                 let oldest = &mut *(*oldest_ptr).state.get();
                 assert!(oldest.rc == 0);
-                Self::list_remove(this, oldest_ptr);
 
                 // Remove node from hash map.
                 let node = this.map.remove(oldest.key.as_ref().unwrap()).unwrap();
                 evict_nodes.push(node);
+
+                // Remove node from LRU list.
+                Self::list_remove(this, oldest_ptr);
             }
         }
 
@@ -175,7 +204,7 @@ where
     }
 
     fn new_impl(capacity: usize) -> Self {
-        let mut dummy = Box::new(Node {
+        let dummy = NodeBox::new(Node {
             state: UnsafeCell::new(NodeState {
                 prev: null(),
                 next: null(),
@@ -185,8 +214,12 @@ where
             value: OnceCell::new(),
         });
 
-        dummy.state.get_mut().prev = dummy.as_ref();
-        dummy.state.get_mut().next = dummy.as_ref();
+        let ptr = dummy.as_ptr();
+        unsafe {
+            let dummy = &mut *dummy.deref().state.get();
+            dummy.prev = ptr;
+            dummy.next = ptr;
+        }
 
         Self {
             state: Mutex::new(LruState {
@@ -203,15 +236,19 @@ where
         Self::maybe_evict(guard, true);
     }
 
+    /// Get the cache handle for the key, initialize the value if not present.
+    /// The value is pinned in cache while the cache handle is live, and would
+    /// not consume capacity.
+    ///
+    /// Multiple threads calling `get_or_init` on the same key is fine. The
+    /// value would be constructed exactly once.
     pub fn get_or_init<'a>(&'a self, key: K, init: impl FnOnce(&K) -> V) -> CacheHandle<'a, K, V> {
         let mut guard = self.state.lock().unwrap();
         let this = guard.deref_mut();
         let node_ptr = match this.map.entry(key.clone()) {
             Entry::Occupied(ent) => unsafe {
-                let b: &Box<_> = ent.get();
-                let n = &**b;
-                let node_ptr = n as *const Node<K, V>;
-                let node = &mut *n.state.get();
+                let node_ptr = ent.get().as_ptr();
+                let node = &mut *ent.get().state.get();
                 node.rc += 1;
                 if node.rc == 1 {
                     Self::list_remove(this, node_ptr);
@@ -219,7 +256,7 @@ where
                 node_ptr
             },
             Entry::Vacant(ent) => {
-                let node = Box::new(Node {
+                let node = NodeBox::new(Node {
                     value: OnceCell::new(),
                     state: UnsafeCell::new(NodeState {
                         prev: null(),
@@ -229,7 +266,7 @@ where
                     }),
                 });
 
-                let node_ptr = node.as_ref() as *const Node<K, V>;
+                let node_ptr = node.as_ptr();
                 ent.insert(node);
                 node_ptr
             }
@@ -264,9 +301,15 @@ mod compile_time_assertions {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, sync::Arc};
-
     use super::*;
+    use std::{
+        mem,
+        sync::{
+            atomic::{AtomicU32, Ordering},
+            Arc,
+        },
+        thread,
+    };
 
     #[test]
     fn simple_get_or_init() {
@@ -329,18 +372,16 @@ mod tests {
         insert_new(1);
         insert_new(2);
         insert_new(3);
-
         assert_eq!(*evicted.lock().unwrap(), vec![1]);
 
         // Pin the value.
         let h4 = insert_new(4);
-
-        assert_eq!(*evicted.lock().unwrap(), vec![1, 2]);
+        assert_eq!(*evicted.lock().unwrap(), vec![1]);
 
         insert_new(5);
         insert_new(6);
-
         assert_eq!(*evicted.lock().unwrap(), vec![1, 2, 3]);
+
         // Unpin.
         drop(h4);
         assert_eq!(*evicted.lock().unwrap(), vec![1, 2, 3, 5]);
@@ -350,5 +391,72 @@ mod tests {
         insert_new(7);
         insert_new(8);
         assert_eq!(*evicted.lock().unwrap(), vec![1, 2, 3, 5, 4, 6]);
+    }
+
+    unsafe fn override_lifetime<'a, 'b, T>(t: &'a T) -> &'b T {
+        mem::transmute(t)
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn stress() {
+        struct IncCounterOnDrop<'a> {
+            counter: &'a AtomicU32,
+        }
+
+        impl<'a> Drop for IncCounterOnDrop<'a> {
+            fn drop(&mut self) {
+                self.counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let capacity = 100u32;
+        let threads = 1;
+        let per_thread_count = 10000;
+        let yield_interval = 1000;
+
+        let init_counter = AtomicU32::new(0);
+        let drop_counter = AtomicU32::new(0);
+        let lru = Lru::new(capacity as usize);
+
+        let mut handles = vec![];
+        for _ in 0..threads {
+            handles.push(thread::spawn({
+                let lru = unsafe { override_lifetime(&lru) };
+                let init_counter = unsafe { override_lifetime(&init_counter) };
+                let drop_counter = unsafe { override_lifetime(&drop_counter) };
+                move || {
+                    for i in 0..per_thread_count {
+                        lru.get_or_init(i, |_| {
+                            init_counter.fetch_add(1, Ordering::Relaxed);
+                            IncCounterOnDrop {
+                                counter: &drop_counter,
+                            }
+                        });
+
+                        if i % yield_interval == 0 {
+                            thread::yield_now();
+                        }
+                    }
+                }
+            }));
+        }
+
+        // Join threads.
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert!(init_counter.load(Ordering::Relaxed) >= per_thread_count);
+        assert_eq!(
+            init_counter.load(Ordering::Relaxed),
+            capacity + drop_counter.load(Ordering::Relaxed)
+        );
+
+        lru.prune();
+        assert_eq!(
+            init_counter.load(Ordering::Relaxed),
+            drop_counter.load(Ordering::Relaxed)
+        );
     }
 }
