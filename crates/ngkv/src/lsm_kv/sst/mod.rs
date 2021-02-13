@@ -6,6 +6,7 @@ pub use write::*;
 
 use std::{
     borrow::Cow,
+    cmp,
     io::{self, Write},
     ops::Deref,
     path::{Path, PathBuf},
@@ -30,8 +31,26 @@ pub struct SstRecord {
     value: Vec<u8>,
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Clone)]
+#[derive(PartialEq, Eq, Clone)]
 pub struct InternalKey<'a>(Cow<'a, [u8]>);
+
+impl PartialOrd for InternalKey<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for InternalKey<'_> {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        // Order:
+        // 1. Key in ascending order.
+        // 2. LSN in descending order.
+        match self.key().cmp(other.key()) {
+            cmp::Ordering::Equal => other.lsn().cmp(&self.lsn()),
+            x => x,
+        }
+    }
+}
 
 impl<'a> InternalKey<'a> {
     fn from_buf(buf: &'a [u8]) -> InternalKey<'a> {
