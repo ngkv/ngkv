@@ -2,14 +2,9 @@ use std::{
     cell::UnsafeCell,
     collections::{hash_map::Entry, HashMap},
     hash::Hash,
-    marker::PhantomData,
     ops::{Deref, DerefMut},
-    ptr::{null, null_mut, NonNull},
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Mutex, MutexGuard,
-    },
-    todo,
+    ptr::null,
+    sync::{Mutex, MutexGuard},
 };
 
 use once_cell::sync::OnceCell;
@@ -17,7 +12,6 @@ use once_cell::sync::OnceCell;
 struct NodeState<K, V> {
     rc: u32,
     key: Option<K>,
-    // in_lru_list: bool,
     prev: *const Node<K, V>,
     next: *const Node<K, V>,
 }
@@ -30,11 +24,17 @@ struct NodeState<K, V> {
 ///    facing potential eviction. In such state, `rc` == 0, `prev` and `next`
 ///    fields form a circular linked list, in LRU order.
 ///
-/// NOTE: Never obtain a mutable reference to nodes (except during
+/// NOTE: NEVER obtain a mutable reference to nodes (except during
 /// initialization). Otherwise, concurrent reader from `CacheHandle` would
 /// violate the aliasing rules.
 struct Node<K, V> {
+    /// NOTE: Reading or writing state requires you holding the big lock.
     state: UnsafeCell<NodeState<K, V>>,
+
+    /// NOTE: Reading or writing value should be done without the big lock held.
+    /// `OnceCell` is used to coordinate possible concurrent initialization,
+    /// i.e. `Lru::get_or_init` issued by multiple thread to the same key at the
+    /// same time.
     value: OnceCell<V>,
 }
 
@@ -51,22 +51,30 @@ struct LruState<K, V> {
     list_size: usize,
 }
 
-pub struct Lru<K, V> {
-    state: Mutex<LruState<K, V>>,
-}
-
-pub struct CacheHandle<'a, K: Hash + Eq + Clone, V> {
+pub struct CacheHandle<'a, K, V>
+where
+    K: Hash + Eq + Clone,
+{
     lru: &'a Lru<K, V>,
     node: *const Node<K, V>,
 }
 
-impl<'a, K: Hash + Eq + Clone, V> CacheHandle<'a, K, V> {
+unsafe impl<'a, K, V> Send for CacheHandle<'a, K, V> where K: Hash + Eq + Clone {}
+unsafe impl<'a, K, V> Sync for CacheHandle<'a, K, V> where K: Hash + Eq + Clone {}
+
+impl<'a, K, V> CacheHandle<'a, K, V>
+where
+    K: Hash + Eq + Clone,
+{
     pub fn value(&self) -> &V {
         unsafe { (*self.node).value.get().unwrap() }
     }
 }
 
-impl<'a, K: Hash + Eq + Clone, V> Drop for CacheHandle<'a, K, V> {
+impl<'a, K, V> Drop for CacheHandle<'a, K, V>
+where
+    K: Hash + Eq + Clone,
+{
     fn drop(&mut self) {
         if let Ok(guard) = self.lru.state.lock() {
             Lru::unref(guard, self.node);
@@ -74,27 +82,99 @@ impl<'a, K: Hash + Eq + Clone, V> Drop for CacheHandle<'a, K, V> {
     }
 }
 
-impl<K: Hash + Eq + Clone, V> Lru<K, V> {
+/// A concurrent LRU cache.
+///
+/// A value is pinned while its `CacheHandle` is live. Capacity specifies how
+/// many unpinned value could be cached. Eviction happens when #unpinned >
+/// capacity, or `Lru::prune` is called.
+///
+/// Keys should be lightweight, while values could be heavyweight. That is,
+/// creating (`Lru::get_or_init`) and dropping value could be time-consuming,
+/// and the cache itself would not be blocked.
+pub struct Lru<K, V> {
+    state: Mutex<LruState<K, V>>,
+}
+
+unsafe impl<K, V> Send for Lru<K, V> {}
+unsafe impl<K, V> Sync for Lru<K, V> {}
+
+impl<K, V> Lru<K, V>
+where
+    K: Send + Sync + Hash + Eq + Clone,
+    V: Send + Sync,
+{
+    pub fn new(capacity: usize) -> Self {
+        Self::new_impl(capacity)
+    }
+}
+
+impl<K, V> Lru<K, V>
+where
+    K: Hash + Eq + Clone,
+{
     unsafe fn link(cur: *const Node<K, V>, next: *const Node<K, V>) {
         (*(*cur).state.get()).next = next;
         (*(*next).state.get()).prev = cur;
     }
 
     /// Append node to list tail (newest).
-    unsafe fn list_append(dummy: *const Node<K, V>, node: *const Node<K, V>) {
-        let prev = (*(*dummy).state.get()).prev;
+    unsafe fn list_append(this: &mut LruState<K, V>, node: *const Node<K, V>) {
+        this.list_size += 1;
+        let dummy = this.list_dummy.as_ref();
+        let prev = (*dummy.state.get()).prev;
         Self::link(node, dummy);
         Self::link(prev, node);
     }
 
-    unsafe fn list_remove(node: *const Node<K, V>) {
+    unsafe fn list_remove(this: &mut LruState<K, V>, node: *const Node<K, V>) {
+        this.list_size -= 1;
         let node = &mut *(*node).state.get();
         Self::link(node.prev, node.next);
         node.prev = null();
         node.next = null();
     }
 
-    pub fn new(capacity: usize) -> Self {
+    fn maybe_evict(mut guard: MutexGuard<LruState<K, V>>, evict_all: bool) {
+        let mut evict_nodes = vec![];
+
+        let this = guard.deref_mut();
+        let target_size = if evict_all { 0 } else { this.capacity };
+
+        unsafe {
+            while this.list_size > target_size {
+                // Only obtain a shared reference to the dummy node.
+                let oldest_ptr = (*this.list_dummy.as_ref().state.get()).next;
+                assert!(oldest_ptr != this.list_dummy.as_ref());
+
+                // Remove node from LRU list.
+                let oldest = &mut *(*oldest_ptr).state.get();
+                assert!(oldest.rc == 0);
+                Self::list_remove(this, oldest_ptr);
+
+                // Remove node from hash map.
+                let node = this.map.remove(oldest.key.as_ref().unwrap()).unwrap();
+                evict_nodes.push(node);
+            }
+        }
+
+        // IMPORTANT: Drop user value without lock held.
+        drop(guard);
+        drop(evict_nodes);
+    }
+
+    fn unref(mut guard: MutexGuard<LruState<K, V>>, node_ptr: *const Node<K, V>) {
+        let this = guard.deref_mut();
+        let node = unsafe { &mut *(*node_ptr).state.get() };
+        node.rc = node.rc.checked_sub(1).unwrap();
+        if node.rc == 0 {
+            unsafe {
+                Self::list_append(this, node_ptr);
+            }
+            Self::maybe_evict(guard, false);
+        }
+    }
+
+    fn new_impl(capacity: usize) -> Self {
         let mut dummy = Box::new(Node {
             state: UnsafeCell::new(NodeState {
                 prev: null(),
@@ -118,45 +198,9 @@ impl<K: Hash + Eq + Clone, V> Lru<K, V> {
         }
     }
 
-    fn maybe_evict(mut guard: MutexGuard<LruState<K, V>>, evict_all: bool) {
-        let mut evict_nodes = vec![];
-
-        let this = guard.deref_mut();
-        let target_size = if evict_all { 0 } else { this.capacity };
-
-        unsafe {
-            while this.list_size > target_size {
-                // Only obtain a shared reference to the dummy node.
-                let oldest_ptr = (*this.list_dummy.as_ref().state.get()).next;
-                assert!(oldest_ptr != this.list_dummy.as_ref());
-
-                // Remove node from LRU list.
-                let oldest = &mut *(*oldest_ptr).state.get();
-                assert!(oldest.rc == 0);
-                this.list_size -= 1;
-                Self::list_remove(oldest_ptr);
-
-                // Remove node from hash map.
-                let node = this.map.remove(oldest.key.as_ref().unwrap()).unwrap();
-                evict_nodes.push(node);
-            }
-        }
-
-        // IMPORTANT: Drop user value without lock held.
-        drop(guard);
-        drop(evict_nodes);
-    }
-
-    fn unref(mut guard: MutexGuard<LruState<K, V>>, node_ptr: *const Node<K, V>) {
-        let this = guard.deref_mut();
-        let node = unsafe { &mut *(*node_ptr).state.get() };
-        node.rc.checked_sub(1).unwrap();
-        if node.rc == 0 {
-            unsafe {
-                Self::list_append(this.list_dummy.as_ref(), node_ptr);
-            }
-            Self::maybe_evict(guard, false);
-        }
+    pub fn prune(&self) {
+        let guard = self.state.lock().unwrap();
+        Self::maybe_evict(guard, true);
     }
 
     pub fn get_or_init<'a>(&'a self, key: K, init: impl FnOnce(&K) -> V) -> CacheHandle<'a, K, V> {
@@ -164,12 +208,13 @@ impl<K: Hash + Eq + Clone, V> Lru<K, V> {
         let this = guard.deref_mut();
         let node_ptr = match this.map.entry(key.clone()) {
             Entry::Occupied(ent) => unsafe {
-                let n = ent.get().deref();
+                let b: &Box<_> = ent.get();
+                let n = &**b;
                 let node_ptr = n as *const Node<K, V>;
                 let node = &mut *n.state.get();
                 node.rc += 1;
                 if node.rc == 1 {
-                    Self::list_remove(node_ptr);
+                    Self::list_remove(this, node_ptr);
                 }
                 node_ptr
             },
@@ -191,7 +236,7 @@ impl<K: Hash + Eq + Clone, V> Lru<K, V> {
         };
 
         unsafe {
-            // IMPORTANT: Call user-provided init function *without* lock held.
+            // IMPORTANT: Call user-provided init function without lock held.
             drop(guard);
             (*node_ptr).value.get_or_init(|| init(&key));
         }
@@ -203,25 +248,107 @@ impl<K: Hash + Eq + Clone, V> Lru<K, V> {
     }
 }
 
+mod compile_time_assertions {
+    use crate::*;
+
+    #[allow(unreachable_code)]
+    fn _assert_public_types_send_sync() {
+        _assert_send_sync::<Lru<u32, u32>>(unreachable!());
+        _assert_send_sync::<CacheHandle<u32, u32>>(unreachable!());
+    }
+
+    fn _assert_send<S: Send>(_: &S) {}
+
+    fn _assert_send_sync<S: Send + Sync>(_: &S) {}
+}
+
 #[cfg(test)]
 mod tests {
-    struct Foo {
-        a: u32,
-        b: u32,
+    use std::{collections::HashSet, sync::Arc};
+
+    use super::*;
+
+    #[test]
+    fn simple_get_or_init() {
+        let cache = Lru::<u32, u32>::new(10);
+        assert_eq!(cache.get_or_init(1, |_| 1).value(), &1);
+        assert_eq!(cache.get_or_init(2, |_| 2).value(), &2);
+        assert_eq!(cache.get_or_init(1, |_| 3).value(), &1);
     }
 
     #[test]
-    fn miri_foo() {
-        unsafe {
-            let mut foo = Foo { a: 100, b: 200 };
-            let p1 = (&mut foo) as *mut Foo;
-            let p2 = (&mut foo) as *mut Foo;
-            let pp1 = &foo;
-            // (*p1).a = 300;
-            // (*p2).a = 500;
-            // (*p1).a = 600;
-            (*p2).a = 700;
-            println!("{}", pp1.a);
+    fn reinsert_after_eviction() {
+        let cache = Lru::<u32, u32>::new(1);
+        assert_eq!(cache.get_or_init(1, |_| 1).value(), &1);
+        assert_eq!(cache.get_or_init(2, |_| 2).value(), &2);
+        assert_eq!(cache.get_or_init(1, |_| 3).value(), &3);
+    }
+
+    struct DropRecorded {
+        evicted: Arc<Mutex<Vec<u32>>>,
+        id: u32,
+    }
+
+    impl Drop for DropRecorded {
+        fn drop(&mut self) {
+            self.evicted.lock().unwrap().push(self.id);
         }
+    }
+
+    #[test]
+    fn evicted_dropped() {
+        let evicted = Arc::new(Mutex::new(Vec::new()));
+
+        let cache = Lru::<u32, DropRecorded>::new(2);
+        let insert_new = |id| {
+            cache.get_or_init(id, |&id| DropRecorded {
+                id,
+                evicted: evicted.clone(),
+            })
+        };
+
+        insert_new(1);
+        insert_new(2);
+        insert_new(3);
+
+        assert_eq!(*evicted.lock().unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn pin_unpin_eviction() {
+        let evicted = Arc::new(Mutex::new(Vec::new()));
+
+        let cache = Lru::<u32, DropRecorded>::new(2);
+        let insert_new = |id| {
+            cache.get_or_init(id, |&id| DropRecorded {
+                id,
+                evicted: evicted.clone(),
+            })
+        };
+
+        insert_new(1);
+        insert_new(2);
+        insert_new(3);
+
+        assert_eq!(*evicted.lock().unwrap(), vec![1]);
+
+        // Pin the value.
+        let h4 = insert_new(4);
+
+        assert_eq!(*evicted.lock().unwrap(), vec![1, 2]);
+
+        insert_new(5);
+        insert_new(6);
+
+        assert_eq!(*evicted.lock().unwrap(), vec![1, 2, 3]);
+        // Unpin.
+        drop(h4);
+        assert_eq!(*evicted.lock().unwrap(), vec![1, 2, 3, 5]);
+        cache.get_or_init(4, |_| panic!("not found"));
+        cache.get_or_init(6, |_| panic!("not found"));
+
+        insert_new(7);
+        insert_new(8);
+        assert_eq!(*evicted.lock().unwrap(), vec![1, 2, 3, 5, 4, 6]);
     }
 }
